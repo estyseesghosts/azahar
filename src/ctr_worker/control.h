@@ -8,6 +8,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/system_titles.h"
 #include "ctr_worker/frames.h"
+#include "ctr_worker/camera.h"
 #include "ctr_worker/debug.h"
 #include "ctr_worker/frontend.h"
 #include "ctr_worker/input.h"
@@ -22,6 +23,7 @@ public:
         ReserveControlOutput();
         Initialize(system, root.string(), unsupported);
         RegisterInput(input);
+        RegisterCamera();
         debug.Attach();
         debug.notification = [this](const Json& data) {
             if (notifications)
