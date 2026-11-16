@@ -205,6 +205,33 @@ public:
         DebugChannel::svc = {};
         DebugChannel::hio = {};
         DebugChannel::single_step = false;
+        DebugChannel::code_breakpoints.clear();
+    }
+    // Execute breakpoints run under the JIT (DebugChannel::code_breakpoints). Instruction
+    // stepping remains for memory watchpoints and pc/memory predicates: a JIT block cannot
+    // stop between a watched access and the rest of the block, and Dynarmic's memory-abort
+    // halt re-executes the instruction after its writeback (load_store.cpp GetAddress writes
+    // Rn before the access; a32_emit_x64_memory.cpp EmitCheckMemoryAbort resets PC to it).
+    bool NeedsInstructionStep() const {
+        if (!predicate.is_null()) {
+            const auto kind = predicate.value("kind", "");
+            if (kind == "pc" || kind == "memory") return true;
+        }
+        return std::any_of(breakpoints.begin(), breakpoints.end(),
+                           [](const auto& entry) { return entry.second.kind != "execute"; });
+    }
+    // Call after any change to breakpoints or predicate. Dynarmic defers ClearCache while a
+    // block is executing, so this is safe from callbacks inside a JIT run.
+    void SyncExecution() {
+        std::set<u32> code;
+        for (const auto& [id, bp] : breakpoints)
+            if (bp.kind == "execute") code.insert(bp.address);
+        if (code != DebugChannel::code_breakpoints) {
+            DebugChannel::code_breakpoints = std::move(code);
+            if (system.IsPoweredOn())
+                for (u32 i = 0; i < system.GetNumCores(); ++i) system.GetCore(i).ClearInstructionCache();
+        }
+        DebugChannel::single_step = NeedsInstructionStep();
     }
     void Clear() {
         if (system.IsPoweredOn() && ipc_callback) {
@@ -229,7 +256,7 @@ public:
         skip_core = 0xffffffff;
         stopped = false;
         stepping = false;
-        DebugChannel::single_step = false;
+        SyncExecution();
     }
     void Resume() {
         if (gpu) gpu->Resume();
@@ -248,7 +275,7 @@ public:
         stop_reason = data;
         predicate=nullptr;
         std::erase_if(breakpoints, [](const auto& entry) { return entry.second.temporary; });
-        DebugChannel::single_step = !breakpoints.empty();
+        SyncExecution();
         for (u32 i = 0; i < system.GetNumCores(); ++i) {
             system.GetCore(i).SetBreakFlag();
             system.GetCore(i).PrepareReschedule();
@@ -1065,7 +1092,7 @@ public:
                 } else if(kind=="draw")gpu->Dispatch({{"operation","gpu_configure"},{"enabled",true},{"stop_events",Json::array()}});
                 else if(kind!="svc"&&kind!="frame")throw std::invalid_argument("unknown predicate");
                 predicate=std::move(next);
-                DebugChannel::single_step=!breakpoints.empty()||kind=="pc"||kind=="memory";
+                SyncExecution();
                 return {{"resume_requested",true},{"budget_frames",frames},{"timeout_ms",timeout},{"predicate",predicate}};
             }
             if(op=="rewind_configure") {
@@ -1205,7 +1232,10 @@ public:
                 for (const auto& [id, bp] : breakpoints)
                     result.push_back({{"id", id}, {"address", bp.address}, {"length", bp.length},
                                       {"kind", bp.kind}, {"hits", bp.hits}});
-                return {{"breakpoints", result}, {"execution_mode", "instruction_step_when_armed"},
+                return {{"breakpoints", result},
+                        {"execution_mode", DebugChannel::single_step ? "instruction_step" : "jit"},
+                        {"execute_breakpoints", "jit_block_split"},
+                        {"watchpoints", "instruction_step_when_armed"},
                         {"watchpoint_precision", "instruction_completed"}, {"maximum", 64}};
             }
             if (op == "breakpoint_set") {
@@ -1227,9 +1257,12 @@ public:
                 breakpoints.emplace(id, Breakpoint{address, length, kind, 0});
                 ForgetHits();
                 breakpoints.at(id).registered_process = system.Kernel().GetCurrentProcess()->process_id;
-                DebugChannel::single_step = true;
-                return {{"id", id}, {"execution_mode", "instruction_step_when_armed"},
-                        {"cost", "high; single instruction dispatch while any breakpoint is armed"}};
+                SyncExecution();
+                return {{"id", id},
+                        {"execution_mode", DebugChannel::single_step ? "instruction_step" : "jit"},
+                        {"cost", kind == "execute"
+                                     ? "low; JIT block ends and halts at the address, single-steps it"
+                                     : "high; single instruction dispatch while a watchpoint is armed"}};
             }
             if (op == "breakpoint_remove") {
                 const auto id = p.at("id").get<u64>();
@@ -1242,7 +1275,7 @@ public:
                             system.Memory().UnregisterWatchpoint(*process, bp.address, bp.length);
                 breakpoints.erase(it);
                 ForgetHits();
-                DebugChannel::single_step = !breakpoints.empty();
+                SyncExecution();
                 return {{"removed", id}};
             }
             if (op == "step") {

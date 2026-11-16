@@ -562,7 +562,8 @@ if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)
         arm/dynarmic/arm_tick_counts.cpp
         arm/dynarmic/arm_tick_counts.h
     )
-    target_link_libraries(citra_core PRIVATE dynarmic)
+    # merry::mcl: arm_dynarmic.cpp emits IR from PreCodeReadHook (a32_ir_emitter.h uses mcl).
+    target_link_libraries(citra_core PRIVATE dynarmic merry::mcl)
 endif()
 
 # FastInterp's dispatch loop requires GCC/Clang computed goto; MSVC builds

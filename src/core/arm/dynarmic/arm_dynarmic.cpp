@@ -4,7 +4,9 @@
 
 #include <csignal>
 #include <cstring>
+#include <dynarmic/frontend/A32/a32_ir_emitter.h>
 #include <dynarmic/interface/A32/a32.h>
+#include <dynarmic/ir/terminal.h>
 #include <dynarmic/interface/optimization_flags.h>
 #include "common/assert.h"
 #include "common/microprofile.h"
@@ -79,6 +81,29 @@ public:
     }
     bool MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) override {
         return memory.WriteExclusive64(vaddr, value, expected);
+    }
+
+    // Debugger execute breakpoints: end the block before the instruction at an armed address,
+    // write that PC and halt the JIT, so the debugger's before_instruction check runs at the
+    // exact instruction. Single-step translations (jit->Step) are left intact; ARM_Dynarmic::Run
+    // uses one to execute a breakpointed instruction the debugger decided not to stop at.
+    // The block-ending sequence mirrors TranslatorVisitor::RaiseException (Dynarmic,
+    // frontend/A32/translate/impl/a32_translate_impl.cpp).
+    bool PreCodeReadHook(bool /*is_thumb*/, VAddr pc, Dynarmic::A32::IREmitter& ir) override {
+        if (DebugChannel::code_breakpoints.empty() || ir.current_location.SingleStepping() ||
+            !DebugChannel::code_breakpoints.contains(pc)) {
+            return true;
+        }
+        ir.UpdateUpperLocationDescriptor();
+        ir.BranchWritePC(ir.Imm32(pc));
+        ir.CallHostFunction(&HaltAtBreakpoint, ir.Imm64(reinterpret_cast<u64>(&parent)));
+        ir.SetTerm(Dynarmic::IR::Term::CheckHalt{Dynarmic::IR::Term::ReturnToDispatch{}});
+        return false;
+    }
+
+    static void HaltAtBreakpoint(u64 parent) {
+        reinterpret_cast<ARM_Dynarmic*>(parent)->jit->HaltExecution(
+            Dynarmic::HaltReason::UserDefined2);
     }
 
     void InterpreterFallback(VAddr pc, std::size_t num_instructions) override {
@@ -202,6 +227,17 @@ void ARM_Dynarmic::Run() {
     MICROPROFILE_SCOPE(ARM_Jit);
     if (break_flag) [[unlikely]] {
         return;
+    }
+
+    // No translated block starts with an armed breakpoint (PreCodeReadHook halts in front of
+    // it). The caller's before_instruction check already declined to stop at this PC, so run
+    // the instruction through a single-step translation, then continue the slice.
+    if (!DebugChannel::code_breakpoints.empty() &&
+        DebugChannel::code_breakpoints.contains(GetPC())) [[unlikely]] {
+        jit->Step();
+        if (break_flag) {
+            return;
+        }
     }
 
     jit->Run();
