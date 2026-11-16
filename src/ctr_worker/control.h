@@ -319,8 +319,8 @@ private:
                 Reply(request, "unsupported");
         } catch (const std::out_of_range&) {
             Reply(request, "invalid_argument");
-        } catch (const std::invalid_argument&) {
-            Reply(request, "invalid_argument");
+        } catch (const std::invalid_argument& error) {
+            Reply(request, "invalid_argument", {{"reason",error.what()}});
         } catch (const Json::exception&) {
             Reply(request, "invalid_argument");
         } catch (const std::filesystem::filesystem_error&) {

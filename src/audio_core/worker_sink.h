@@ -56,7 +56,7 @@ public:
             stats.hash = (stats.hash ^ (value >> 8)) * 1099511628211ull;
         }
         if (capture.is_open()) {
-            constexpr size_t limit = 64u << 20;
+            constexpr size_t limit = (64u << 20) - 44; // Include the WAV header in the file budget.
             const auto bytes = std::min(count * 4, limit - capture_bytes);
             capture.write(static_cast<const char*>(data), bytes);
             capture_bytes += static_cast<u32>(bytes);
