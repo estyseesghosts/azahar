@@ -248,7 +248,7 @@ public:
         }
         breakpoints.clear();
         scan.clear();
-        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;
+        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;hits_untracked=false;
         replaying=false;position_at_hit=false;
         predicate=nullptr;
         hio_pending = 0;
@@ -404,7 +404,9 @@ public:
         history_bytes+=bytes.size();history_frame=frame;
         std::map<u64,u64> hits;
         for (const auto& [id, bp] : breakpoints) hits[id] = bp.hits;
-        history.push_back({std::move(bytes),frame,core,input,SettingsSnapshot(),Json::object(),0,std::move(hits)});
+        history.push_back({std::move(bytes),frame,core,input,SettingsSnapshot(),Json::object(),0,std::move(hits),
+                           skip_core,skip_pc});
+        hits_untracked=false;
     }
     void MarkHistoryStop() { if(rewind_enabled && stopped && !history.empty())history.back().stop=stop_reason; }
     Json HistoryStatus() const {
@@ -449,10 +451,13 @@ public:
     // stepping reproduces the same hit sequence; a watchpoint target is replayed
     // a second time to the instruction index of its access, so the session lands
     // before the access executes.
-    // Hits counted under another breakpoint set cannot be replayed.
+    // Hits counted under another breakpoint set cannot be replayed. A replay from an older
+    // checkpoint would count executions from before the change as hits, so hits stay
+    // uncounted until the next checkpoint opens a window under the current set.
     void ForgetHits() {
         for (auto& entry : history) entry.window_hits = 0;
         position_at_hit = false;
+        if (rewind_enabled) { hits_untracked = true; ForceCheckpoint(); }
     }
     bool Hit(const char* reason, Json data, u64 instruction) {
         if (replaying) {
@@ -463,7 +468,7 @@ public:
             HaltReplay();
             return true;
         }
-        if (rewind_enabled && !history.empty()) ++history.back().window_hits;
+        if (rewind_enabled && !history.empty() && !hits_untracked) ++history.back().window_hits;
         Stop(reason, std::move(data));
         return true;
     }
@@ -493,7 +498,9 @@ public:
         apply_input(entry.input);
         set_frame(entry.frame);
         stopped = false;
-        skip_core = 0xffffffff;
+        // A checkpoint taken while resuming from an execute breakpoint must not re-hit it on replay.
+        skip_core = entry.skip_core;
+        skip_pc = entry.skip_pc;
     }
     // Runs the restored checkpoint until HaltReplay; false on divergence or budget.
     bool Replay(u64 halt_instruction, u64 hit_target, u64 frame_limit) {
@@ -1478,7 +1485,9 @@ private:
         std::vector<u8> bytes;u64 frame;std::optional<u32> core;Json input,settings,stop;
         u64 window_hits=0;            // breakpoint/watchpoint stops observed after this checkpoint
         std::map<u64,u64> bp_hits;    // breakpoint hit counters at this checkpoint
+        u32 skip_core=0xffffffff, skip_pc=0; // resume-from-breakpoint skip in effect at this checkpoint
     };
+    bool hits_untracked=false;        // breakpoint set changed since the newest checkpoint
     bool replaying=false, position_at_hit=false;
     u64 replay_target=0, replay_hits=0, replay_instructions=0, replay_halt_instruction=~0ull, replay_hit_instruction=0;
     Json replay_hit;
