@@ -53,6 +53,10 @@ public:
      */
     virtual Samples Read() = 0;
 
+    // Deterministic frontend sources can retain their cursor through savestates.
+    virtual u64 GetReplayCursor() const { return 0; }
+    virtual void SetReplayCursor(u64) {}
+
 protected:
     InputParameters parameters;
 };

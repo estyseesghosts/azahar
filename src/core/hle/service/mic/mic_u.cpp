@@ -414,10 +414,13 @@ private:
         ar & encoding;
         bool is_sampling = mic && mic->IsSampling();
         ar & is_sampling;
+        u64 replay_cursor=mic?mic->GetReplayCursor():0;
+        ar & replay_cursor;
         if (Archive::is_loading::value) {
             if (is_sampling) {
                 CreateMic();
                 StartSampling();
+                mic->SetReplayCursor(replay_cursor);
             } else if (mic) {
                 mic->StopSampling();
             }
