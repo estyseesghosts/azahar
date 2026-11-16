@@ -38,6 +38,7 @@ if (BSD STREQUAL "OpenBSD")
 endif()
 
 option(ENABLE_LIBRETRO "Build as a LibRetro core" OFF)
+option(ENABLE_CTR_WORKER "Build the native external control worker" OFF)
 
 # Some submodules like to pick their own default build type if not specified.
 # Make sure we default to Release build type always, unless the generator has custom types.
@@ -656,3 +657,4 @@ if(ENABLE_QT AND UNIX AND NOT APPLE)
     install(FILES "${PROJECT_SOURCE_DIR}/dist/org.azahar_emu.Azahar.xml"
             DESTINATION "${CMAKE_INSTALL_PREFIX}/share/mime/packages")
 endif()
+

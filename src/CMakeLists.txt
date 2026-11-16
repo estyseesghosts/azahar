@@ -233,3 +233,8 @@ endif()
 if (ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
 endif()
+
+# Optional native process frontend; no product/UI dependencies.
+if (ENABLE_CTR_WORKER)
+    add_subdirectory(ctr_worker)
+endif()
