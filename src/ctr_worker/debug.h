@@ -157,7 +157,7 @@ public:
             if (it == bindings.end()) throw std::invalid_argument("unknown setting");
             if (op == "settings_set") {
                 if (system.IsPoweredOn() && std::string{it->apply} != "live")
-                    throw std::invalid_argument("boot setting requires an unloaded session");
+                    throw std::invalid_argument(std::string{it->apply} + " setting requires an unloaded session");
                 const auto& value = p.at("value");
                 if ((name == "use_gdbstub" || name == "enable_rpc_server" ||
                      name == "use_custom_storage") && value != false)
