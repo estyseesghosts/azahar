@@ -32,6 +32,7 @@
 #include "core/dumping/backend.h"
 #include "core/file_sys/ncch_container.h"
 #include "core/frontend/image_interface.h"
+#include "core/frontend/control_callback.h"
 #ifdef ENABLE_GDBSTUB
 #include "core/gdbstub/gdbstub.h"
 #endif
@@ -316,6 +317,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
 }
 
 void System::ProcessPendingWork() {
+    if (Frontend::control_callback) Frontend::control_callback();
     // Processes work that needs to run on the emulation thread. This function is called from
     // two places, the RunLoop slice and during the frame limiter wait period.
     // To wake up the frame limiter so that it processes more work, other threads must call

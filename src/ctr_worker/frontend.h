@@ -15,8 +15,12 @@
 namespace CtrWorker {
 class Window final : public Frontend::EmuWindow {
 public:
-    Window() { UpdateCurrentFramebufferLayout(400, 480); }
-    void PollEvents() override { ++frames; }
+    Window() {
+        UpdateCurrentFramebufferLayout(400, 480);
+    }
+    void PollEvents() override {
+        ++frames;
+    }
     u64 frames = 0;
 };
 
@@ -28,7 +32,10 @@ public:
         unsupported = true;
         Finalize("", 0);
     }
-    void ShowError(const std::string&) override { unsupported = true; }
+    void ShowError(const std::string&) override {
+        unsupported = true;
+    }
+
 private:
     bool& unsupported;
 };
@@ -41,6 +48,7 @@ public:
         unsupported = true;
         Finalize(1, {});
     }
+
 private:
     bool& unsupported;
 };
