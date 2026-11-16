@@ -73,6 +73,7 @@ public:
             [this](const char* reason,Json data){Stop(reason,std::move(data));});
         DebugChannel::before_instruction = [this](auto& core, auto* thread) {
             if (stopped) return true;
+            if (replaying && replay_instructions == replay_halt_instruction) { HaltReplay(); return true; }
             if (stepping) return false;
             if(!predicate.is_null() && predicate.value("core",0u)==core.GetID()) {
                 const auto kind=predicate.value("kind","");bool matches=false;
@@ -92,10 +93,13 @@ public:
                 ++bp.hits;
                 if (bp.hits < bp.hit_after || !Matches(bp.condition, core)) continue;
                 if (!bp.log.empty()) { Record("logpoint", {{"breakpoint", id}, {"text", bp.log}, {"pc", core.GetPC()}}); continue; }
-                Stop("breakpoint", {{"breakpoint", id}, {"address", bp.address}, {"core", core.GetID()},
-                                   {"thread", thread->thread_id}, {"process", process ? process->process_id : 0}});
-                return true;
+                if (Hit("breakpoint", {{"breakpoint", id}, {"address", bp.address}, {"core", core.GetID()},
+                                   {"thread", thread->thread_id}, {"process", process ? process->process_id : 0}},
+                        replay_instructions))
+                    return true;
+                break;
             }
+            if (replaying) ++replay_instructions;
             return false;
         };
         DebugChannel::memory_access = [this](u32 address, u32 length, bool write) {
@@ -112,8 +116,10 @@ public:
                         Record("logpoint", {{"breakpoint", id}, {"text", bp.log}, {"address", address}, {"write", write}});
                         continue;
                     }
-                    Stop("watchpoint", {{"breakpoint", id}, {"address", address}, {"write", write},
-                        {"core", system.GetRunningCore().GetID()}, {"access_completed", true}});
+                    Hit("watchpoint", {{"breakpoint", id}, {"address", address}, {"write", write},
+                        {"core", system.GetRunningCore().GetID()}, {"access_completed", true},
+                        {"pc", system.GetRunningCore().GetPC()}},
+                        replay_instructions ? replay_instructions - 1 : 0);
                     break;
                 }
             }
@@ -216,6 +222,7 @@ public:
         breakpoints.clear();
         scan.clear();
         history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;
+        replaying=false;position_at_hit=false;
         predicate=nullptr;
         hio_pending = 0;
         stop_reason = Json::object();
@@ -236,6 +243,7 @@ public:
     void Stop(const char* reason, Json data) {
         if (stopped) return;
         stopped = true;
+        position_at_hit = std::string{reason} == "breakpoint";
         data["reason"] = reason;
         stop_reason = data;
         predicate=nullptr;
@@ -277,6 +285,7 @@ public:
         if (!enabled && ipc_callback) { recorder.UnbindCallback(ipc_callback);ipc_callback.reset(); }
     }
     void Record(const char* kind, Json data) {
+        if (replaying) return; // replayed history must not re-emit past events
         data["kind"] = kind;
         data["sequence"] = ++event_sequence;
         data["guest_ticks"] = system.IsPoweredOn() ? system.CoreTiming().GetGlobalTicks() : 0;
@@ -355,13 +364,16 @@ public:
             history_bytes-=history.front().bytes.size();history.pop_front();++history_lost;
         }
         history_bytes+=bytes.size();history_frame=frame;
-        history.push_back({std::move(bytes),frame,core,input,SettingsSnapshot(),Json::object()});
+        std::map<u64,u64> hits;
+        for (const auto& [id, bp] : breakpoints) hits[id] = bp.hits;
+        history.push_back({std::move(bytes),frame,core,input,SettingsSnapshot(),Json::object(),0,std::move(hits)});
     }
     void MarkHistoryStop() { if(rewind_enabled && stopped && !history.empty())history.back().stop=stop_reason; }
     Json HistoryStatus() const {
         return {{"enabled",rewind_enabled},{"snapshots",history.size()},{"bytes",history_bytes},
             {"capacity",history_capacity},{"budget_bytes",history_budget},{"lost_snapshots",history_lost},
-            {"instruction_history","explicit step operations; continuous execution records frame safe points"}};
+            {"instruction_history","explicit step operations; continuous execution records frame safe points"},
+            {"reverse_continue","replays from frame or instruction checkpoints with instruction stepping; lands before the previous breakpoint or watchpoint access"}};
     }
     Json Reverse(std::optional<u32> core) {
         if(!rewind_enabled || history.empty())throw std::invalid_argument("rewind history unavailable");
@@ -394,6 +406,186 @@ public:
         history_frame=~0ull;
         return result;
     }
+    // Reverse continue: breakpoint/watchpoint stops are counted per rewind
+    // checkpoint while running forward. Replaying a checkpoint with instruction
+    // stepping reproduces the same hit sequence; a watchpoint target is replayed
+    // a second time to the instruction index of its access, so the session lands
+    // before the access executes.
+    // Hits counted under another breakpoint set cannot be replayed.
+    void ForgetHits() {
+        for (auto& entry : history) entry.window_hits = 0;
+        position_at_hit = false;
+    }
+    bool Hit(const char* reason, Json data, u64 instruction) {
+        if (replaying) {
+            if (++replay_hits != replay_target) return false;
+            data["reason"] = reason;
+            replay_hit = std::move(data);
+            replay_hit_instruction = instruction;
+            HaltReplay();
+            return true;
+        }
+        if (rewind_enabled && !history.empty()) ++history.back().window_hits;
+        Stop(reason, std::move(data));
+        return true;
+    }
+    void HaltReplay() {
+        stopped = true;
+        for (u32 i = 0; i < system.GetNumCores(); ++i) {
+            system.GetCore(i).SetBreakFlag();
+            system.GetCore(i).PrepareReschedule();
+        }
+    }
+    void RestoreHistory(size_t index) {
+        const auto& entry = history[index];
+        const bool trace = trace_svc;
+        SetTrace(false);
+        ArmWatches(false);
+        if (!system.LoadStateBuffer(entry.bytes)) throw std::runtime_error("rewind restore failed");
+        ArmWatches(true);
+        if (trace) SetTrace(true);
+        for (u32 i = 0; i < system.GetNumCores(); ++i) {
+            system.GetCore(i).ClearInstructionCache();
+            system.GetCore(i).ClearBreakFlag();
+        }
+        for (auto& [id, bp] : breakpoints) {
+            const auto it = entry.bp_hits.find(id);
+            bp.hits = it == entry.bp_hits.end() ? 0 : it->second;
+        }
+        apply_input(entry.input);
+        set_frame(entry.frame);
+        stopped = false;
+        skip_core = 0xffffffff;
+    }
+    // Runs the restored checkpoint until HaltReplay; false on divergence or budget.
+    bool Replay(u64 halt_instruction, u64 hit_target, u64 frame_limit) {
+        replaying = true;
+        replay_hits = 0;
+        replay_instructions = 0;
+        replay_target = hit_target;
+        replay_halt_instruction = halt_instruction;
+        replay_hit = nullptr;
+        const bool single = DebugChannel::single_step;
+        DebugChannel::single_step = true;
+        auto callback = std::exchange(Frontend::control_callback, {});
+        auto finish = [&] {
+            Frontend::control_callback = std::move(callback);
+            DebugChannel::single_step = single;
+            replaying = false;
+        };
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        bool ok = true;
+        try {
+            while (!stopped) {
+                if (std::chrono::steady_clock::now() >= deadline || get_frame() > frame_limit) {
+                    ok = false;
+                    break;
+                }
+                if (system.RunLoop() != Core::System::ResultStatus::Success) {
+                    ok = false;
+                    break;
+                }
+            }
+        } catch (...) {
+            finish();
+            throw;
+        }
+        finish();
+        std::scoped_lock lock{pending_mutex};
+        pending_events.clear(); // native logs produced by the replay duplicate the past
+        return ok && stopped;
+    }
+    Json ReverseContinue() {
+        if (!rewind_enabled || history.empty()) throw std::invalid_argument("rewind history unavailable");
+        if (!stopped) throw std::invalid_argument("reverse continue requires a stopped session");
+        if (breakpoints.empty()) throw std::invalid_argument("reverse continue needs a breakpoint or watchpoint");
+        if (hio_pending) throw std::invalid_argument("reverse execution cannot cross a pending HIO request");
+        if (system.Kernel().AreAsyncOperationsPending())
+            throw std::invalid_argument("asynchronous guest operations pending; step forward and retry");
+        size_t k = history.size() - 1;
+        u64 target = history[k].window_hits;
+        if (position_at_hit && target) --target;
+        while (!target) {
+            if (!k) throw std::invalid_argument("no earlier breakpoint or watchpoint hit in rewind history");
+            target = history[--k].window_hits;
+        }
+        if (history[k].settings != SettingsSnapshot()) throw std::invalid_argument("rewind profile changed");
+        // Keep the present so a diverging replay cannot lose the user's position.
+        ArmWatches(false);
+        std::vector<u8> present;
+        try {
+            present = system.SaveStateBuffer();
+        } catch (...) {
+            ArmWatches(true);
+            throw;
+        }
+        ArmWatches(true);
+        const auto present_stop = stop_reason;
+        const auto present_frame = get_frame();
+        const auto present_input = get_input();
+        std::map<u64, u64> present_hits;
+        for (const auto& [id, bp] : breakpoints) present_hits[id] = bp.hits;
+        const bool present_at_hit = position_at_hit;
+        auto restore_present = [&] {
+            const bool trace = trace_svc;
+            SetTrace(false);
+            ArmWatches(false);
+            system.LoadStateBuffer(present);
+            ArmWatches(true);
+            if (trace) SetTrace(true);
+            for (u32 i = 0; i < system.GetNumCores(); ++i) system.GetCore(i).ClearInstructionCache();
+            for (auto& [id, bp] : breakpoints)
+                if (present_hits.count(id)) bp.hits = present_hits[id];
+            apply_input(present_input);
+            set_frame(present_frame);
+            stopped = false;
+            Stop(present_stop.value("reason", std::string{"manual"}).c_str(), present_stop);
+            position_at_hit = present_at_hit;
+        };
+        const auto limit = present_frame + 2;
+        RestoreHistory(k);
+        if (!Replay(~0ull, target, limit)) {
+            restore_present();
+            throw std::runtime_error("reverse replay did not reproduce the recorded hit; present state restored");
+        }
+        auto hit = replay_hit;
+        const auto instruction = replay_hit_instruction;
+        const bool watch = hit.value("reason", "") == "watchpoint";
+        if (watch) {
+            RestoreHistory(k);
+            if (!Replay(instruction, ~0ull, limit) || replay_instructions != instruction) {
+                restore_present();
+                throw std::runtime_error("reverse replay did not reach the watched access; present state restored");
+            }
+        }
+        while (history.size() > k + 1) {
+            history_bytes -= history.back().bytes.size();
+            history.pop_back();
+        }
+        // A watchpoint landing is before its access, which will be counted again going forward.
+        history[k].window_hits = watch ? target - 1 : target;
+        history_frame = ~0ull;
+        stopped = false;
+        const auto reason = hit.value("reason", std::string{"breakpoint"});
+        hit.erase("reason");
+        hit["reverse"] = true;
+        hit["checkpoint"] = k;
+        hit["hit_ordinal"] = target;
+        hit["replayed_guest_instructions"] = instruction;
+        if (watch) {
+            hit["access_completed"] = false;
+            hit["position"] = "before the access instruction executes";
+            hit["pc"] = system.GetCore(hit.value("core", 0u)).GetPC();
+        }
+        Stop(reason.c_str(), hit);
+        return {{"worker_frame", get_frame()}, {"worker_input", history[k].input}, {"reverse", true},
+                {"history_kind", "replay"}, {"replayed_guest_instructions", instruction},
+                {"stop", StopReason()}};
+    }
+    std::function<void(const Json&)> apply_input;
+    std::function<Json()> get_input;
+    std::function<u64()> get_frame;
+    std::function<void(u64)> set_frame;
     std::function<void(const Json&)> notification;
 #endif
 
@@ -871,7 +1063,8 @@ public:
                 rewind_enabled=p.at("enabled");history_capacity=capacity;history_budget=u64(budget)<<20;
                 history.clear();history_bytes=history_lost=0;history_frame=~0ull;return HistoryStatus();
             }
-            if(op=="reverse_step"||op=="reverse_continue")return Reverse(op=="reverse_step"?std::optional<u32>{p.at("core").get<u32>()}:std::nullopt);
+            if(op=="reverse_step")return Reverse(p.at("core").get<u32>());
+            if(op=="reverse_continue")return ReverseContinue();
 
             if (op == "breakpoint_configure") {
                 auto& bp = breakpoints.at(p.at("id").get<u64>());
@@ -880,6 +1073,7 @@ public:
                 bp.condition = p.at("condition");
                 bp.log = p.at("log").is_null() ? "" : p.at("log").get<std::string>();
                 if (bp.log.size()>512) throw std::invalid_argument("logpoint exceeds budget");
+                ForgetHits();
                 return {{"configured", p.at("id")}};
             }
             if (op == "run_to" || op == "step_over" || op == "step_out") {
@@ -1020,6 +1214,7 @@ public:
                 }
                 const auto id = ++next_breakpoint;
                 breakpoints.emplace(id, Breakpoint{address, length, kind, 0});
+                ForgetHits();
                 breakpoints.at(id).registered_process = system.Kernel().GetCurrentProcess()->process_id;
                 DebugChannel::single_step = true;
                 return {{"id", id}, {"execution_mode", "instruction_step_when_armed"},
@@ -1035,6 +1230,7 @@ public:
                         if (process->process_id == bp.registered_process)
                             system.Memory().UnregisterWatchpoint(*process, bp.address, bp.length);
                 breakpoints.erase(it);
+                ForgetHits();
                 DebugChannel::single_step = !breakpoints.empty();
                 return {{"removed", id}};
             }
@@ -1220,7 +1416,14 @@ private:
         return false;
     }
     struct Candidate { u32 address; u64 value; };
-    struct HistoryEntry { std::vector<u8> bytes;u64 frame;std::optional<u32> core;Json input,settings,stop; };
+    struct HistoryEntry {
+        std::vector<u8> bytes;u64 frame;std::optional<u32> core;Json input,settings,stop;
+        u64 window_hits=0;            // breakpoint/watchpoint stops observed after this checkpoint
+        std::map<u64,u64> bp_hits;    // breakpoint hit counters at this checkpoint
+    };
+    bool replaying=false, position_at_hit=false;
+    u64 replay_target=0, replay_hits=0, replay_instructions=0, replay_halt_instruction=~0ull, replay_hit_instruction=0;
+    Json replay_hit;
     std::deque<HistoryEntry> history;
     bool rewind_enabled=false;
     size_t history_capacity=32;

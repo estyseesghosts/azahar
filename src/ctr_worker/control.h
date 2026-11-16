@@ -25,6 +25,13 @@ public:
         RegisterInput(input);
         RegisterCamera();
         debug.Attach();
+        debug.apply_input = [this](const Json& restored) {
+            ApplyInput(input, restored.at("state"));
+            owner = restored.at("owner").get<std::string>();
+        };
+        debug.get_input = [this] { return Json{{"owner", owner}, {"state", SnapshotInput(input)}}; };
+        debug.get_frame = [this] { return window.frames; };
+        debug.set_frame = [this](u64 frame) { window.frames = frame; };
         debug.notification = [this](const Json& data) {
             if (notifications)
                 Send({{"notification", true}, {"version_major", 1}, {"version_minor", 0},
