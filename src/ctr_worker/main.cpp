@@ -3,6 +3,7 @@
 #include <string_view>
 #include <chrono>
 #include "ctr_worker/frontend.h"
+#include "ctr_worker/frames.h"
 #include "core/core.h"
 
 int main(int argc, char** argv) {
@@ -28,6 +29,8 @@ int main(int argc, char** argv) {
             result = system.RunLoop();
         std::cout << "presented_frames=" << window.frames << " result=" << static_cast<unsigned>(result)
                   << " unsupported_applet=" << unsupported << std::endl;
+        if (window.frames >= 60)
+            std::cout << CtrWorker::Capture(system, argv[3], 1, window.frames).dump() << std::endl;
         if (system.IsPoweredOn()) system.Shutdown();
         Common::Log::Stop();
         return result == Core::System::ResultStatus::Success && window.frames >= 60 && !unsupported ? 0 : 1;
