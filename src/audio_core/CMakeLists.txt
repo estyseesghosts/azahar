@@ -47,6 +47,9 @@ add_library(audio_core STATIC EXCLUDE_FROM_ALL
 )
 
 create_target_directory_groups(audio_core)
+if (ENABLE_CTR_WORKER)
+    target_compile_definitions(audio_core PRIVATE CTR_WORKER_AUDIO)
+endif()
 
 target_link_libraries(audio_core PUBLIC citra_common citra_core)
 target_link_libraries(audio_core PRIVATE SoundTouch teakra)

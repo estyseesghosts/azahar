@@ -7,6 +7,9 @@
 #include <string>
 #include <vector>
 #include "audio_core/null_sink.h"
+#ifdef CTR_WORKER_AUDIO
+#include "audio_core/worker_sink.h"
+#endif
 #include "audio_core/sink_details.h"
 #ifdef HAVE_SDL2
 #include "audio_core/sdl2_sink.h"
@@ -59,6 +62,11 @@ constexpr std::array sink_details = {
                     return std::make_unique<NullSink>(device_id);
                 },
                 [] { return std::vector<std::string>{"None"}; }},
+#ifdef CTR_WORKER_AUDIO
+    SinkDetails{SinkType::Worker, "Worker muted ring",
+                [](std::string_view) -> std::unique_ptr<Sink> { return std::make_unique<WorkerSink>(); },
+                [] { return std::vector<std::string>{"None"}; }},
+#endif
 };
 } // Anonymous namespace
 
