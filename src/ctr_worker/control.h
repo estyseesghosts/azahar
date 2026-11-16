@@ -60,7 +60,9 @@ public:
                 debug.Poll();
                 Drain(false);
                 if (state == "running") {
-                    debug.Remember(window.frames,{{"owner",owner},{"state",SnapshotInput(input)}});
+                    // Build the JSON input snapshot only when a frame checkpoint will be stored.
+                    if (debug.WantsFrameCheckpoint(window.frames))
+                        debug.Remember(window.frames,{{"owner",owner},{"state",SnapshotInput(input)}});
                     const auto result = system.RunLoop();
                     debug.CheckFramePredicate(window.frames);
                     if (debug.IsStopped() || result != Core::System::ResultStatus::Success || unsupported ||
@@ -208,6 +210,7 @@ private:
                         Reply(request,"permission_denied");return;
                     }
                     ApplyInput(input,params.at("state"));owner=requested;system.ApplySettings();
+                    debug.ForceCheckpoint();
                     Reply(request,"ok",{{"input",params.at("state")},{"owner",owner},{"safe_point",true},
                         {"paused",state!="running"},{"rasterizer_cache_flush",false}});return;
                 }
@@ -353,6 +356,7 @@ private:
                 }
                 owner = requested_owner;
                 input = {buttons, x / 320.0f, y / 240.0f, params.value("touch", false)};
+                debug.ForceCheckpoint();
                 Reply(request, "ok", Snapshot());
             } else if (method == "registers") {
                 const auto core = static_cast<u32>(Unsigned(params, "core", 3));

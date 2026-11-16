@@ -248,7 +248,7 @@ public:
         }
         breakpoints.clear();
         scan.clear();
-        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;
+        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;
         replaying=false;position_at_hit=false;
         predicate=nullptr;
         hio_pending = 0;
@@ -380,8 +380,19 @@ public:
         if(!stopped && !predicate.is_null() && predicate.value("kind","")=="frame" && frame>=predicate.at("frame").get<u64>())
             Stop("predicate",{{"predicate",predicate},{"frame",frame}});
     }
+    // Frame checkpoint due: every `history_interval` frames, after a restore (frame moved
+    // back) and after an input change. Reverse replay restarts a window with the input held
+    // at its checkpoint, so input must not change inside a window. No allocation.
+    bool WantsFrameCheckpoint(u64 frame) const {
+        if(!rewind_enabled)return false;
+        if(history_force)return true; // may repeat a frame number: input changed mid-frame
+        if(history_frame==frame)return false;
+        return history_frame==~0ull || frame<history_frame || frame-history_frame>=history_interval;
+    }
+    void ForceCheckpoint() { history_force=true; }
     void Remember(u64 frame, const Json& input, std::optional<u32> core={}) {
-        if(!rewind_enabled || (!core && history_frame==frame))return;
+        if(!rewind_enabled || (!core && !WantsFrameCheckpoint(frame)))return;
+        if(!core)history_force=false;
         if(system.Kernel().AreAsyncOperationsPending()){++history_lost;return;}
         ArmWatches(false);std::vector<u8> bytes;
         try {bytes=system.SaveStateBuffer();}catch(...){ArmWatches(true);throw;}
@@ -397,7 +408,7 @@ public:
     }
     void MarkHistoryStop() { if(rewind_enabled && stopped && !history.empty())history.back().stop=stop_reason; }
     Json HistoryStatus() const {
-        return {{"enabled",rewind_enabled},{"snapshots",history.size()},{"bytes",history_bytes},
+        return {{"enabled",rewind_enabled},{"interval_frames",history_interval},{"snapshots",history.size()},{"bytes",history_bytes},
             {"capacity",history_capacity},{"budget_bytes",history_budget},{"lost_snapshots",history_lost},
             {"instruction_history","explicit step operations; continuous execution records frame safe points"},
             {"reverse_continue","replays from frame or instruction checkpoints with instruction stepping; lands before the previous breakpoint or watchpoint access"}};
@@ -1098,7 +1109,10 @@ public:
             if(op=="rewind_configure") {
                 const auto capacity=p.at("capacity").get<u32>(),budget=p.at("budget_mib").get<u32>();
                 if(!capacity||capacity>128||budget<16||budget>256)throw std::invalid_argument("invalid rewind budget");
+                const auto interval=p.value("interval_frames",1u);
+                if(!interval||interval>60)throw std::invalid_argument("rewind interval 1..60 frames");
                 rewind_enabled=p.at("enabled");history_capacity=capacity;history_budget=u64(budget)<<20;
+                history_interval=interval;history_force=false;
                 history.clear();history_bytes=history_lost=0;history_frame=~0ull;return HistoryStatus();
             }
             if(op=="reverse_step")return Reverse(p.at("core").get<u32>());
@@ -1471,7 +1485,8 @@ private:
     std::deque<HistoryEntry> history;
     bool rewind_enabled=false;
     size_t history_capacity=32;
-    u64 history_bytes=0,history_budget=64u<<20,history_lost=0,history_frame=~0ull;
+    u64 history_bytes=0,history_budget=64u<<20,history_lost=0,history_frame=~0ull,history_interval=1;
+    bool history_force=false;
     std::vector<Candidate> scan;
     u32 scan_width = 0;
     std::unique_ptr<GpuTools> gpu;
