@@ -82,7 +82,7 @@ public:
 private:
     Json Snapshot() {
         const auto audio = AudioCore::WorkerSink::Drain();
-        return {{"source", CTR_SOURCE_SHA},         {"frames", window.frames},
+        return {{"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
                 {"last_error", last_error},         {"input_owner", owner},
                 {"buttons", input.buttons},         {"touch_down", input.touch},
                 {"audio_samples", audio.samples},   {"audio_dropped", audio.dropped},
