@@ -87,6 +87,10 @@ public:
     /// Returns an immutable reference to the PICA GPU.
     [[nodiscard]] const Pica::PicaCore& PicaCore() const;
 
+    /// Replaces the PICA debug context used by the GPU and PICA core; null disables
+    /// per-command events. Call only at an emulation-thread safe point.
+    void SetDebugContext(std::shared_ptr<Pica::DebugContext> context);
+
     /// Returns a mutable reference to the GSP command debugger.
     [[nodiscard]] GraphicsDebugger& Debugger();
 

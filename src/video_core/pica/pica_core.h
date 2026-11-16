@@ -118,6 +118,15 @@ public:
 
     void SetInterruptHandler(Service::GSP::InterruptHandler& signal_interrupt);
 
+    /// Attaches or detaches per-command debug events. A null context selects the batched
+    /// command path. Call only between command lists (an emulation-thread safe point).
+    void SetDebugContext(std::shared_ptr<DebugContext> context) {
+        debug_context = std::move(context);
+    }
+
+    /// Commands written by the batched fast path since construction (debug telemetry).
+    u64 fast_path_commands = 0;
+
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
 private:

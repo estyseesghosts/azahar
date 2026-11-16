@@ -309,6 +309,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
                 // Process the commands that we have read so far (up to 4).
                 if (run > 0) {
                     delay_generator.AddCommands(run);
+                    fast_path_commands += run;
                     for (u32 i = 0; i < run; ++i) {
                         const u32 id = ids[i];
                         const u32 write_mask = ExpandBitsToBytes[masks[i]];

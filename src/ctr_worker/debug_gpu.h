@@ -19,9 +19,18 @@ public:
     using Json=nlohmann::json;
     using Callback=std::function<void(const char*,Json)>;
     GpuTools(Core::System& system,const std::filesystem::path& root,Callback record,Callback stop)
-        :system(system),root(root),record(std::move(record)),stop(std::move(stop)) {
-        if (!Pica::g_debug_context) Pica::g_debug_context=Pica::DebugContext::Construct();
+        :system(system),root(root),record(std::move(record)),stop(std::move(stop)),
+         context(Pica::DebugContext::Construct()) {
+        // Pica::g_debug_context stays null: a context captured at GPU construction would keep
+        // PicaCore on its per-command path (pica_core.cpp, ProcessCmdList `if (!debug_context)`)
+        // for the whole session. The context is attached only while capture is enabled.
         DebugChannel::gpu_event=[this](u32 event,const void* data){Event(event,data);};
+    }
+    ~GpuTools(){Activate(false);DebugChannel::gpu_event={};}
+    // Emulation-thread safe point only (worker dispatch runs between RunLoop calls).
+    void Activate(bool on) {
+        if(system.IsPoweredOn())system.GPU().SetDebugContext(on?context:nullptr);
+        if(!on){DebugChannel::gpu_vertex_output={};return;}
         DebugChannel::gpu_vertex_output=[this](const void* data){
             if(enabled&&(!halted||collect_stop_inputs)&&data&&!draws.empty()) {
                 auto& outputs=draws.back().outputs;if(outputs.size()<8) {
@@ -32,8 +41,7 @@ public:
             }
         };
     }
-    ~GpuTools(){DebugChannel::gpu_event={};DebugChannel::gpu_vertex_output={};}
-    void Clear(){enabled=false;breaks.reset();draws.clear();draw_sequence=command_sequence=resource_sequence=0;resources.clear();halted=false;}
+    void Clear(){Activate(false);enabled=false;breaks.reset();draws.clear();draw_sequence=command_sequence=resource_sequence=0;resources.clear();halted=false;}
     void Resume(){halted=false;collect_stop_inputs=false;}
     std::vector<u8> Physical(u32 address,u32 length) {
         if(!length||length>(4u<<20)||u64(address)+length>0x100000000ull)
@@ -45,6 +53,7 @@ public:
         system.GPU().Renderer().Rasterizer()->FlushRegion(address,length);
         return std::vector<u8>(first,first+length);
     }
+    u64 FastPathCommands() const {return system.IsPoweredOn()?system.GPU().PicaCore().fast_path_commands:0;}
     static u64 Hash(const std::vector<u8>& bytes){return Common::ComputeHash64(bytes.data(),bytes.size());}
     Json Resource(u32 address,u32 length,const char* kind) {
         const auto bytes=Physical(address,length);
@@ -175,15 +184,19 @@ public:
     Json Dispatch(const Json& p) {
         const auto op=p.at("operation").get<std::string>();
         if(op=="gpu_configure") {
-            enabled=p.at("enabled");breaks.reset();
-            for(auto event:p.at("stop_events").get<std::vector<u32>>()){if(event>=8)throw std::invalid_argument("PICA event 0..7");breaks.set(event);}
-            return {{"enabled",enabled},{"stop_events",p.at("stop_events")},{"draw_capacity",8},{"vertices_per_draw",8}};
+            const auto events=p.at("stop_events").get<std::vector<u32>>();
+            for(auto event:events)if(event>=8)throw std::invalid_argument("PICA event 0..7");
+            enabled=p.at("enabled");breaks.reset();for(auto event:events)breaks.set(event);
+            Activate(enabled);
+            return {{"enabled",enabled},{"stop_events",p.at("stop_events")},{"draw_capacity",8},{"vertices_per_draw",8},
+                {"command_path",enabled?"per_command":"batched"},{"fast_path_commands",FastPathCommands()}};
         }
         if(op=="gpu_draws") {
             Json list=Json::array();
             for(auto& draw:draws)list.push_back({{"draw",draw.id},{"vertices",draw.inputs.size()},
                 {"command",draw.data.at("command")},{"artifact",draw.artifact}});
-            return {{"draws",list},{"lost_draws",draws_lost},{"lost_vertices",vertices_lost},{"lost_resource_versions",resource_versions_lost}};
+            return {{"draws",list},{"command_path",enabled?"per_command":"batched"},
+                {"fast_path_commands",FastPathCommands()},{"lost_draws",draws_lost},{"lost_vertices",vertices_lost},{"lost_resource_versions",resource_versions_lost}};
         }
         if(op=="gpu_draw"||op=="shader_trace") {
             const auto id=p.at("draw").get<u64>();
@@ -251,6 +264,7 @@ private:
         std::vector<Pica::AttributeBuffer> inputs,outputs;Json data;Json artifact;
     };
     Core::System& system;std::filesystem::path root;Callback record,stop;
+    std::shared_ptr<Pica::DebugContext> context;
     bool enabled=false,halted=false,collect_stop_inputs=false;std::bitset<8> breaks;
     u64 draw_sequence=0,command_sequence=0,resource_sequence=0,surface_sequence=0,draws_lost=0,vertices_lost=0;
     std::deque<Draw> draws;

@@ -433,6 +433,11 @@ const Pica::PicaCore& GPU::PicaCore() const {
     return impl->pica;
 }
 
+void GPU::SetDebugContext(std::shared_ptr<Pica::DebugContext> context) {
+    impl->debug_context = context;
+    impl->pica.SetDebugContext(std::move(context));
+}
+
 GraphicsDebugger& GPU::Debugger() {
     return impl->gpu_debugger;
 }
