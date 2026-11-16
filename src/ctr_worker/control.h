@@ -200,8 +200,7 @@ private:
                 }
                 content = path;
                 state = "paused";
-                if (method == "reset")
-                    ++epoch;
+                ++epoch;
                 Reply(request, "ok", Snapshot());
                 return;
             }
