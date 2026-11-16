@@ -59,7 +59,7 @@ inline bool Receive(nlohmann::json& request, const std::atomic_bool& stop) {
     return !request.is_discarded();
 }
 inline void Send(const nlohmann::json& reply) {
-    const auto payload = reply.dump();
+    const auto payload = reply.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     if (payload.size() > 65536)
         throw std::runtime_error("reply exceeds control bound");
     for (unsigned i = 0; i < 4; ++i)

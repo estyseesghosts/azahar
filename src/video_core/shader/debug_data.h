@@ -77,6 +77,7 @@ struct DebugData<true> {
     u32 max_offset = 0;    ///< maximum program counter ever reached
     u32 max_opdesc_id = 0; ///< maximum swizzle pattern index ever used
 
+    bool truncated = false;
     /// List of records for each executed shader instruction
     std::vector<DebugData<true>::Record> records;
 };

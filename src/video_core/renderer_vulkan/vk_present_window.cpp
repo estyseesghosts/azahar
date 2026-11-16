@@ -101,14 +101,15 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
                              Scheduler& scheduler_, bool low_refresh_rate_)
     : emu_window{emu_window_}, instance{instance_}, scheduler{scheduler_},
       low_refresh_rate{low_refresh_rate_},
-      surface{CreateSurface(instance.GetInstance(), emu_window)}, next_surface{surface},
+      surface{emu_window.GetWindowInfo().type == Frontend::WindowSystemType::Headless
+                  ? vk::SurfaceKHR{} : CreateSurface(instance.GetInstance(), emu_window)}, next_surface{surface},
       swapchain{instance, emu_window.GetFramebufferLayout().width,
                 emu_window.GetFramebufferLayout().height, surface, low_refresh_rate_},
       graphics_queue{instance.GetGraphicsQueue()}, present_renderpass{CreateRenderpass()},
       vsync_enabled{Settings::values.use_vsync.GetValue()},
       blit_supported{
           CanBlitToSwapchain(instance.GetPhysicalDevice(), swapchain.GetSurfaceFormat().format)},
-      use_present_thread{Settings::values.async_presentation.GetValue()},
+      use_present_thread{surface && Settings::values.async_presentation.GetValue()},
       last_render_surface{emu_window.GetWindowInfo().render_surface} {
 
     const u32 num_images = swapchain.GetImageCount();
@@ -259,16 +260,15 @@ Frame* PresentWindow::GetRenderFrame() {
     vk::Result result{};
 
     const auto wait = [&]() {
-        result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
+        result = device.waitForFences(frame->present_done, false, 5000000000ull);
         return result;
     };
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
         // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
-        }
+        if (result == vk::Result::eTimeout) throw std::runtime_error("Vulkan present fence deadline");
+        if (result == vk::Result::eErrorDeviceLost) throw std::runtime_error("Vulkan device lost");
 
         // eErrorInitializationFailed occurs on Mali GPU drivers due to them
         // using the ppoll() syscall which isn't correctly restarted after a signal,
@@ -371,6 +371,18 @@ void PresentWindow::NotifySurfaceChanged() {
 }
 
 void PresentWindow::CopyToSwapchain(Frame* frame) {
+    if (!surface) {
+        // Consume render_ready and signal completion without any platform surface.
+        const vk::PipelineStageFlags stage = vk::PipelineStageFlagBits::eAllCommands;
+        const vk::SubmitInfo submit{
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &frame->render_ready,
+            .pWaitDstStageMask = &stage,
+        };
+        std::scoped_lock lock{scheduler.submit_mutex};
+        graphics_queue.submit(submit, frame->present_done);
+        return;
+    }
     const auto recreate_swapchain = [&] {
 #ifdef ANDROID
         {

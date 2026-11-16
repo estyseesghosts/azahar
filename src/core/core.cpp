@@ -33,6 +33,7 @@
 #include "core/file_sys/ncch_container.h"
 #include "core/frontend/image_interface.h"
 #include "core/frontend/control_callback.h"
+#include "core/frontend/debug_channel.h"
 #ifdef ENABLE_GDBSTUB
 #include "core/gdbstub/gdbstub.h"
 #endif
@@ -97,6 +98,8 @@ System::~System() = default;
  * set, a single instruction otherwise, or a single instruction if a debugger asked to step it.
  */
 static void ExecuteCore(ARM_Interface& core, Kernel::Thread* thread, bool tight_loop) {
+    if (DebugChannel::before_instruction && DebugChannel::before_instruction(core, thread)) return;
+    if (DebugChannel::single_step) tight_loop = false;
 #ifdef ENABLE_GDBSTUB
     if (thread->gdb_single_step) [[unlikely]] {
         // Keep a reference to the thread in case it just exits.
@@ -316,6 +319,22 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     return status;
 }
 
+bool System::DebugStep(u32 id) {
+    if (!IsPoweredOn() || id >= cpu_cores.size()) return false;
+    running_core = cpu_cores[id].get();
+    kernel->SetRunningCPU(running_core);
+    auto& manager = kernel->GetThreadManager(id);
+    if (!manager.GetCurrentThread()) {
+        running_core->GetTimer().Advance();
+        manager.Reschedule();
+    }
+    if (!manager.GetCurrentThread()) return false;
+    running_core->ClearBreakFlag();
+    running_core->Step();
+    Reschedule();
+    return true;
+}
+
 void System::ProcessPendingWork() {
     if (Frontend::control_callback) Frontend::control_callback();
     // Processes work that needs to run on the emulation thread. This function is called from
@@ -522,9 +541,14 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     }
     kernel->SetCurrentProcess(process);
     title_id = 0;
-    if (app_loader->ReadProgramId(title_id) != Loader::ResultStatus::Success) {
-        LOG_ERROR(Core, "Failed to find title id for ROM (Error {})",
-                  static_cast<u32>(load_result));
+    const auto program_id_result = app_loader->ReadProgramId(title_id);
+    if (program_id_result != Loader::ResultStatus::Success) {
+        if (app_loader->GetFileType() == Loader::FileType::THREEDSX) {
+            LOG_INFO(Core, "3DSX homebrew has no NCCH title id; continuing with id 0");
+        } else {
+            LOG_WARNING(Core, "No title id available for loaded ROM (Error {}); continuing",
+                        static_cast<u32>(program_id_result));
+        }
     }
 
     cheat_engine.LoadCheatFile(title_id);

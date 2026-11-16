@@ -134,6 +134,7 @@ public:
      * execution (such as GDB or scripting requests). Called by RunLoop between slices and from
      * the frame limiter.
      */
+    bool DebugStep(u32 core);
     void ProcessPendingWork();
 
     /**

@@ -1236,6 +1236,13 @@ public:
      * Scans all storage mediums for titles for listing.
      */
     void ScanForAllTitles();
+    std::vector<u64> DebugTitles(u32 media,u32 offset,u32 limit) {
+        std::scoped_lock lock{am_lists_mutex};std::vector<u64> result;
+        if(media>=am_title_list.size())return result;
+        const auto& titles=am_title_list[media];
+        for(size_t i=offset;i<titles.size()&&result.size()<limit;++i)result.push_back(titles[i]);
+        return result;
+    }
 
 private:
     void ScanForTickets();

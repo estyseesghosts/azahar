@@ -1190,6 +1190,14 @@ void RendererVulkan::LimitFramesAheadOfGpu() {
     previous_game_frame_tick = scheduler.CurrentTick() - 1;
 }
 
+void RendererVulkan::CaptureOffscreen(void* pixels, const Layout::FramebufferLayout& layout) {
+    bool complete = false;
+    RequestScreenshot(pixels, [&complete](bool) { complete = true; }, layout);
+    PrepareRendertarget();
+    RenderScreenshot();
+    if (!complete) throw std::runtime_error("offscreen readback failed");
+}
+
 void RendererVulkan::RenderScreenshot() {
     if (!settings.screenshot_requested.exchange(false)) {
         return;

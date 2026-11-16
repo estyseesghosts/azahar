@@ -18,6 +18,13 @@ namespace Vulkan {
 Swapchain::Swapchain(const Instance& instance_, u32 width, u32 height, vk::SurfaceKHR surface_,
                      bool low_refresh_rate)
     : instance{instance_}, surface{surface_} {
+    if (!surface) {
+        surface_format = {vk::Format::eB8G8R8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
+        image_count = 3;
+        this->width = width;
+        this->height = height;
+        return;
+    }
     FindPresentFormat();
     SetPresentMode();
     Create(width, height, surface, low_refresh_rate);
@@ -25,7 +32,7 @@ Swapchain::Swapchain(const Instance& instance_, u32 width, u32 height, vk::Surfa
 
 Swapchain::~Swapchain() {
     Destroy();
-    instance.GetInstance().destroySurfaceKHR(surface);
+    if (surface) instance.GetInstance().destroySurfaceKHR(surface);
 }
 
 void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_, bool low_refresh_rate_) {
@@ -264,10 +271,8 @@ void Swapchain::Destroy() {
         device.destroySwapchainKHR(swapchain);
         swapchain = VK_NULL_HANDLE;
     }
-    for (u32 i = 0; i < image_count; i++) {
-        device.destroySemaphore(image_acquired[i]);
-        device.destroySemaphore(present_ready[i]);
-    }
+    for (const auto semaphore : image_acquired) device.destroySemaphore(semaphore);
+    for (const auto semaphore : present_ready) device.destroySemaphore(semaphore);
     image_acquired.clear();
     present_ready.clear();
 }

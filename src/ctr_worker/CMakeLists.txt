@@ -6,5 +6,7 @@ target_compile_definitions(ctr-worker PRIVATE CTR_SOURCE_SHA="${CTR_SOURCE_SHA}"
 set(CTR_BACKEND_NAME "AZAHAR" CACHE STRING "Public name of this backend build")
 target_compile_definitions(ctr-worker PRIVATE CTR_BACKEND_NAME="${CTR_BACKEND_NAME}")
 if (WIN32)
-    target_link_libraries(ctr-worker PRIVATE crypt32)
+    target_link_libraries(ctr-worker PRIVATE crypt32 ole32)
 endif()
+
+target_compile_definitions(ctr-worker PRIVATE CTR_EXPERIMENTAL=1)

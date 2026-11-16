@@ -115,6 +115,9 @@ static void RunInterpreter(const ShaderSetup& setup, ShaderUnit& state,
     u32 iteration = 0;
     bool should_stop = false;
     while (!should_stop) {
+        if constexpr (Debug) {
+            if (iteration>=8192) { debug_data.truncated=true;return; }
+        }
         bool is_break = false;
         const u32 old_program_counter = program_counter;
 

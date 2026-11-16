@@ -359,6 +359,7 @@ void Movie::Play(Service::IR::ExtraHIDResponse& extra_hid_response) {
 }
 
 void Movie::Record(const ControllerState& controller_state) {
+    if(recording_budget && current_byte+sizeof(ControllerState)>recording_budget){++dropped_inputs;return;}
     recorded_input.resize(current_byte + sizeof(ControllerState));
     std::memcpy(&recorded_input[current_byte], &controller_state, sizeof(ControllerState));
     current_byte += sizeof(ControllerState);
@@ -556,6 +557,7 @@ void Movie::StartPlayback(const std::string& movie_file) {
 }
 
 void Movie::StartRecording(const std::string& movie_file, const std::string& author) {
+    dropped_inputs=0;
     play_mode = PlayMode::Recording;
     record_movie_file = movie_file;
     record_movie_author = author;

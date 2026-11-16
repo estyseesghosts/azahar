@@ -132,6 +132,8 @@ public:
 
     u64 GetCurrentInputIndex() const;
     u64 GetTotalInputCount() const;
+    void SetRecordingBudget(u64 bytes) { recording_budget=bytes; }
+    u64 GetDroppedInputs() const { return dropped_inputs; }
 
     /**
      * Saves the movie immediately, in its current state.
@@ -184,6 +186,7 @@ private:
     u64 program_id = 0;
     u32 rerecord_count = 1;
     bool read_only = true;
+    u64 recording_budget=0,dropped_inputs=0;
 
     std::function<void()> playback_completion_callback = [] {};
 

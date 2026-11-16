@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #pragma once
+#include "common/file_util.h"
 
 #include <memory>
 #include <optional>
@@ -87,7 +88,7 @@ private:
         ar& boost::serialization::base_object<ArchiveFactory>(*this);
         ar& boost::serialization::base_object<ArticCacheProvider>(*this);
         ar & type;
-        ar & mount_point;
+        ar & FileUtil::Path::make(mount_point);
     }
     friend class boost::serialization::access;
 };

@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #pragma once
+#include "common/file_util.h"
 
 #include <string>
 #include "core/file_sys/archive_backend.h"
@@ -43,7 +44,7 @@ private:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::base_object<ArchiveBackend>(*this);
-        ar & mount_point;
+        ar & FileUtil::Path::make(mount_point);
         ar & allow_zero_size_create;
     }
     friend class boost::serialization::access;

@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #pragma once
+#include "common/file_util.h"
 
 #include <map>
 #include <memory>
@@ -142,8 +143,8 @@ private:
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::base_object<RomFSReader>(*this);
         ar & romfs;
-        ar & patch_path;
-        ar & patch_ext_path;
+        ar & FileUtil::Path::make(patch_path);
+        ar & FileUtil::Path::make(patch_ext_path);
         ar & load_relocations;
         if (Archive::is_loading::value) {
             Load();

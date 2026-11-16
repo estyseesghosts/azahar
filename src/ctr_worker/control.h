@@ -6,7 +6,9 @@
 #include "core/arm/arm_interface.h"
 #include "core/frontend/control_callback.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/system_titles.h"
 #include "ctr_worker/frames.h"
+#include "ctr_worker/debug.h"
 #include "ctr_worker/frontend.h"
 #include "ctr_worker/input.h"
 #include "ctr_worker/transport.h"
@@ -22,6 +24,12 @@ public:
 #endif
         Initialize(system, root.string(), unsupported);
         RegisterInput(input);
+        debug.Attach();
+        debug.notification = [this](const Json& data) {
+            if (notifications)
+                Send({{"notification", true}, {"version_major", 1}, {"version_minor", 0},
+                      {"session", session}, {"epoch", epoch}, {"data", data}});
+        };
         Settings::values.output_type = AudioCore::SinkType::Worker;
         Frontend::control_callback = [this] { Drain(true); };
         std::thread reader{[this] {
@@ -42,14 +50,22 @@ public:
         }};
         try {
             while (!stopping && !disconnected) {
+                debug.Poll();
                 Drain(false);
                 if (state == "running") {
+                    debug.Remember(window.frames,{{"owner",owner},{"state",SnapshotInput(input)}});
                     const auto result = system.RunLoop();
-                    if (result != Core::System::ResultStatus::Success || unsupported ||
+                    debug.CheckFramePredicate(window.frames);
+                    if (debug.IsStopped() || result != Core::System::ResultStatus::Success || unsupported ||
                         window.frames >= target || std::chrono::steady_clock::now() >= deadline) {
                         state = "paused";
+                        if (!debug.IsStopped())
+                            debug.Stop(result != Core::System::ResultStatus::Success ? "exception" : "frame",
+                                       {{"frame", window.frames}});
+                        debug.MarkHistoryStop();
                         last_error = unsupported ? "unsupported_applet"
                                      : result != Core::System::ResultStatus::Success ? "core_error"
+                                     : debug.IsStopped() && debug.StopReason().value("reason", "") != "frame" ? ""
                                      : window.frames < target ? "host_deadline"
                                                               : "";
                         if (pending_run) {
@@ -73,8 +89,10 @@ public:
         stopping = true;
         reader.join();
         Frontend::control_callback = {};
+        debug.Detach();
         if (system.IsPoweredOn())
             system.Shutdown();
+        AudioCore::WorkerSink::CaptureStop();
         Common::Log::Stop();
         return exit_code;
     }
@@ -82,8 +100,8 @@ public:
 private:
     Json Snapshot() {
         const auto audio = AudioCore::WorkerSink::Drain();
-        return {{"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
-                {"last_error", last_error},         {"input_owner", owner},
+        return {{"debug_api", true}, {"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
+                {"stop", debug.StopReason()}, {"last_error", last_error},         {"input_owner", owner},
                 {"buttons", input.buttons},         {"touch_down", input.touch},
                 {"audio_samples", audio.samples},   {"audio_dropped", audio.dropped},
                 {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered}};
@@ -150,7 +168,7 @@ private:
             Reply(request, "stale_epoch");
             return;
         }
-        const auto method = request["method"].get<std::string>();
+        auto method = request["method"].get<std::string>();
         if (method == "hello" && session.empty())
             session = id;
         if (session.empty()) {
@@ -158,12 +176,59 @@ private:
             return;
         }
         try {
-            const auto params = request.value("params", Json::object());
+            auto params = request.value("params", Json::object());
+            if(method=="debug" && params.value("operation","")=="boot_home_menu") {
+                const auto region=params.at("region").get<u32>();
+                if(region>=Core::NUM_SYSTEM_TITLE_REGIONS)throw std::invalid_argument("invalid HOME Menu region");
+                const auto path=Core::GetHomeMenuNcchPath(region);
+                if(!std::filesystem::is_regular_file(path)){
+                    Reply(request,"not_ready",{{"error","home_menu_missing"},{"region",region}});return;
+                }
+                method="load";params={{"path",path}};
+            }
+            if (method == "hello") notifications = params.is_object() && params.value("notifications", false);
             if (method == "hello" || method == "status") {
                 Reply(request, "ok", Snapshot());
                 return;
             }
+            if (method == "debug") {
+                if (params.value("operation", "") == "input_state") {
+                    if(system.Movie().GetPlayMode()==Core::Movie::PlayMode::Playing)throw std::invalid_argument("movie playback owns input");
+                    if (!system.IsPoweredOn()) throw std::invalid_argument("input requires loaded content");
+                    const auto requested = params.at("owner").get<std::string>();
+                    if ((requested!="live" && requested!="scenario") || (owner=="scenario" && requested!=owner)) {
+                        Reply(request,"permission_denied");return;
+                    }
+                    ApplyInput(input,params.at("state"));owner=requested;system.ApplySettings();
+                    Reply(request,"ok",{{"input",params.at("state")},{"owner",owner},{"safe_point",true},
+                        {"paused",state!="running"},{"rasterizer_cache_flush",false}});return;
+                }
+                auto debug_params = params;
+                debug_params["worker_frame"] = window.frames;
+                debug_params["worker_input"] = {{"owner",owner},{"state",SnapshotInput(input)}};
+                auto result = debug.Dispatch(debug_params, state);
+                if (params.value("operation", "") == "load_state" ||
+                    params.value("operation", "") == "reverse_step" || params.value("operation", "") == "reverse_continue") {
+                    ++epoch;
+                    capture_sequence = 0;
+                    window.frames = result.at("worker_frame").get<u64>();
+                    const auto restored=result.at("worker_input");
+                    ApplyInput(input,restored.at("state"));owner=restored.at("owner").get<std::string>();
+                    if(params.value("operation", "") == "load_state") debug.Stop("manual", {{"state_loaded", true}});
+                }
+                if (result.value("resume_requested", false)) {
+                    result["paused"]=false;
+                    debug.Resume();
+                    target = window.frames + result.value("budget_frames",600u);
+                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(result.value("timeout_ms",20000u));
+                    state = "running";
+                }
+                Reply(request, "ok", std::move(result));
+                return;
+            }
             if (method == "stop") {
+                system.Movie().Shutdown();
+                debug.Clear();
                 state = "stopped";
                 if (system.IsPoweredOn())
                     system.Shutdown();
@@ -177,11 +242,18 @@ private:
                     return;
                 }
                 const auto path = method == "load" ? params.at("path").get<std::string>() : content;
-                if (path.empty() || !std::filesystem::is_regular_file(path) ||
-                    std::filesystem::path(path).extension() != ".3dsx") {
+                if(Settings::values.audio_emulation.GetValue()!=Settings::AudioEmulation::HLE &&
+                    !std::filesystem::is_regular_file(root/"sdmc/3ds/dspfirm.cdc")) {
+                    Reply(request,"not_ready",{{"error","missing_dsp_firmware"},
+                        {"required_asset","dsp_firmware"},{"session_path","sdmc/3ds/dspfirm.cdc"}});return;
+                }
+                const auto extension=std::filesystem::path(path).extension().string();
+                const std::set<std::string> supported={".3dsx",".elf",".3ds",".cci",".cxi",".app",".z3dsx",".zcci",".zcxi"};
+                if (path.empty() || !std::filesystem::is_regular_file(path) || !supported.contains(extension)) {
                     Reply(request, "invalid_argument");
                     return;
                 }
+                debug.Clear();
                 if (system.IsPoweredOn())
                     system.Shutdown();
                 unsupported = false;
@@ -190,6 +262,7 @@ private:
                 last_error.clear();
                 owner = "live";
                 AudioCore::WorkerSink::Reset();
+                debug.MovieBeforeLoad();
                 const auto result = system.Load(window, path);
                 if (result != Core::System::ResultStatus::Success) {
                     if (system.IsPoweredOn())
@@ -199,6 +272,7 @@ private:
                     return;
                 }
                 content = path;
+                debug.MovieAfterLoad();
                 state = "paused";
                 ++epoch;
                 Reply(request, "ok", Snapshot());
@@ -218,6 +292,7 @@ private:
                     Reply(request, "invalid_argument");
                     return;
                 }
+                debug.Resume();
                 target = window.frames + frames;
                 deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
                 state = "running";
@@ -226,6 +301,7 @@ private:
                 else
                     Reply(request, "ok", Snapshot());
             } else if (method == "pause") {
+                debug.Stop("manual", Json::object());
                 state = "paused";
                 if (pending_run) {
                     Reply(*pending_run, "not_ready", {{"reason", "interrupted"}});
@@ -238,9 +314,10 @@ private:
                     return;
                 }
                 Reply(request, "ok",
-                      {{"frames", Capture(system, root, epoch, ++capture_sequence)},
+                      {{"frames", Capture(system, root, epoch, ++capture_sequence, params.is_object()?params.value("scale",1u):1u)},
                        {"frame", window.frames}});
             } else if (method == "input") {
+                if(system.Movie().GetPlayMode()==Core::Movie::PlayMode::Playing)throw std::invalid_argument("movie playback owns input");
                 const auto requested_owner = params.at("owner").get<std::string>();
                 if (requested_owner != "live" && requested_owner != "scenario") {
                     Reply(request, "invalid_argument");
@@ -296,6 +373,8 @@ private:
                       {{"address", address}, {"bytes", bytes}, {"safe_point", true}});
             } else
                 Reply(request, "unsupported");
+        } catch (const std::out_of_range&) {
+            Reply(request, "invalid_argument");
         } catch (const std::invalid_argument&) {
             Reply(request, "invalid_argument");
         } catch (const Json::exception&) {
@@ -315,10 +394,11 @@ private:
     Core::System& system = Core::System::GetInstance();
     std::filesystem::path root;
     Window window;
+    DebugTools debug{system, root};
     InputState input;
     std::string session, content, last_error, state = "idle", owner = "live";
     u64 epoch = 1, target = 0, capture_sequence = 0, last_request = 0;
-    bool unsupported = false;
+    bool unsupported = false, notifications = false;
     int exit_code = 0;
     std::chrono::steady_clock::time_point deadline;
     std::optional<Json> pending_run;

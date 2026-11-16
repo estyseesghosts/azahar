@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string_view>
+#include <functional>
 #include "common/logging/filter.h"
 #ifdef HAVE_LIBRETRO
 #include "libretro.h"
@@ -13,6 +14,9 @@
 namespace Common::Log {
 
 class Filter;
+struct Entry;
+// Optional bounded frontend observer. It must not log or read mutable guest state.
+void SetObserver(std::function<void(const Entry&)> observer);
 
 /// Initializes the logging system. This should be the first thing called in main.
 void Initialize(std::string_view log_file = "");

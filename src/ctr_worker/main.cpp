@@ -6,13 +6,25 @@
 #include "ctr_worker/control.h"
 #include "ctr_worker/frames.h"
 #include "ctr_worker/frontend.h"
+#ifdef _WIN32
+#include <objbase.h>
+#endif
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    struct ComApartment {
+        HRESULT result=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+        ~ComApartment(){if(SUCCEEDED(result))CoUninitialize();}
+    } apartment;
+    if(FAILED(apartment.result) && apartment.result!=RPC_E_CHANGED_MODE) {
+        std::cerr<<"worker COM initialization failed\n";return 2;
+    }
+#endif
     if (argc == 2 && std::string_view{argv[1]} == "--self-test") {
         AudioCore::WorkerSink::Reset();
         AudioCore::WorkerSink sink;
         std::vector<s16> samples(80000, 123);
-        sink.PushSamples(samples.data(), 40000);
+        AudioCore::WorkerSink::Record(samples.data(), 40000);
         const auto audio = AudioCore::WorkerSink::Drain();
         if (audio.samples != 40000 || audio.buffered != 16384 || audio.dropped != 23616 ||
             AudioCore::WorkerSink::Drain().buffered != 0)

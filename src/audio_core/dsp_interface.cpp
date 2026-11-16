@@ -7,6 +7,9 @@
 #include <vector>
 #include "audio_core/dsp_interface.h"
 #include "audio_core/sink.h"
+#ifdef CTR_WORKER_AUDIO
+#include "audio_core/worker_sink.h"
+#endif
 #include "audio_core/sink_details.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -105,6 +108,10 @@ void DspInterface::PushSamples(std::span<const std::array<s16, 2>> samples) {
         return;
     }
 
+#ifdef CTR_WORKER_AUDIO
+    if (Settings::values.output_type.GetValue() == SinkType::Worker)
+        WorkerSink::Record(samples.data(), samples.size());
+#endif
     if (sink->ImmediateSubmission()) {
         sink->PushSamples(samples.data(), samples.size());
     } else {

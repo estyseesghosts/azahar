@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #pragma once
+#include "core/frontend/debug_channel.h"
 
 #include <condition_variable>
 #include <iterator>
@@ -120,6 +121,7 @@ public:
      * Resume() is called.
      */
     void OnEvent(Event event, const void* data) {
+        if (DebugChannel::gpu_event) DebugChannel::gpu_event(static_cast<u32>(event),data);
         // This check is left in the header to allow the compiler to inline it.
         if (!breakpoints[(int)event].enabled)
             return;

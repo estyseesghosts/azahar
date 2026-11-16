@@ -14,6 +14,7 @@
 #include "core/arm/arm_interface.h"
 #include "core/arm/exception_handler.h"
 #include "core/core.h"
+#include "core/frontend/debug_channel.h"
 #include "core/core_timing.h"
 #ifdef ENABLE_GDBSTUB
 #include "core/gdbstub/hio.h"
@@ -1146,6 +1147,7 @@ Result SVC::ArbitrateAddress(Handle handle, u32 address, u32 type, u32 value, s6
 }
 
 void SVC::Break(u8 break_reason) {
+    if (DebugChannel::svc_break) { DebugChannel::svc_break(break_reason); return; }
     std::string reason_str;
     switch (break_reason) {
     case 0:
@@ -1174,6 +1176,7 @@ void SVC::OutputDebugString(VAddr address, s32 len) {
     }
 
     if (len == 0) {
+        if (DebugChannel::hio) { DebugChannel::hio(address); return; }
 #ifdef ENABLE_GDBSTUB
         GDBStub::SetHioRequest(system, kernel.GetCurrentProcess().get(), address);
 #endif
@@ -1185,8 +1188,10 @@ void SVC::OutputDebugString(VAddr address, s32 len) {
         return;
     }
 
+    len = std::min<s32>(len, 8192);
     std::string string(len, ' ');
     memory.ReadBlock(*kernel.GetCurrentProcess(), address, string.data(), len);
+    if (DebugChannel::guest_log) DebugChannel::guest_log(address, string);
     LOG_DEBUG(Debug_Emulated, "{}", string);
 }
 
@@ -2438,6 +2443,7 @@ MICROPROFILE_DEFINE(Kernel_SVC, "Kernel", "SVC", MP_RGB(70, 200, 70));
 
 void SVC::CallSVC(u32 immediate) {
     MICROPROFILE_SCOPE(Kernel_SVC);
+    if (DebugChannel::svc) DebugChannel::svc(immediate, true);
     system.perf_stats->BeginSVCProcessing();
 
     // Lock the kernel mutex when we enter the kernel HLE.
@@ -2457,6 +2463,7 @@ void SVC::CallSVC(u32 immediate) {
         }
     }
     system.perf_stats->EndSVCProcessing();
+    if (DebugChannel::svc) DebugChannel::svc(immediate, false);
 }
 
 SVC::SVC(Core::System& system) : system(system), kernel(system.Kernel()), memory(system.Memory()) {}

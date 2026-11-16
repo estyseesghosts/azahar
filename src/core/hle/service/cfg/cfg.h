@@ -195,6 +195,14 @@ public:
     Module(Core::System& system_);
     ~Module();
 
+    /// Native frontend profile access, with the same permission checks as CFG services.
+    Result ReadProfileBlock(u32 id, u32 size, void* output) {
+        return GetConfigBlock(id, size, AccessFlag::SystemRead, output);
+    }
+    Result WriteProfileBlock(u32 id, u32 size, const void* input) {
+        return SetConfigBlock(id, size, AccessFlag::SystemWrite, input);
+    }
+
     class Interface : public ServiceFramework<Interface> {
     public:
         Interface(std::shared_ptr<Module> cfg, const char* name, u32 max_session);

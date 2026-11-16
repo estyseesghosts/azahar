@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #pragma once
+#include <vector>
 
 #include <array>
 #include <cstddef>
@@ -86,6 +87,14 @@ public:
     template <class T>
     std::shared_ptr<T> Get(Handle handle) const {
         return DynamicObjectCast<T>(GetGeneric(handle));
+    }
+
+    /// Safe-point debugger snapshot; handle generations retain their real guest encoding.
+    std::vector<std::pair<Handle, std::shared_ptr<Object>>> DebugHandles() const {
+        std::vector<std::pair<Handle, std::shared_ptr<Object>>> result;
+        for (u32 slot = 0; slot < objects.size(); ++slot)
+            if (objects[slot]) result.emplace_back((slot << 15) | generations[slot], objects[slot]);
+        return result;
     }
 
     /// Closes all handles held in this table.

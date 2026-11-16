@@ -14,6 +14,7 @@
 #include "core/arm/dynarmic/arm_tick_counts.h"
 #include "core/arm/exception_handler.h"
 #include "core/core.h"
+#include "core/frontend/debug_channel.h"
 #include "core/core_timing.h"
 #ifdef ENABLE_GDBSTUB
 #include "core/gdbstub/gdbstub.h"
@@ -114,6 +115,13 @@ public:
         case Dynarmic::A32::Exception::PreloadData:
         case Dynarmic::A32::Exception::PreloadDataWithIntentToWrite:
         case Dynarmic::A32::Exception::PreloadInstruction:
+            return;
+        }
+
+        if (DebugChannel::exception) {
+            parent.SetPC(pc);
+            DebugChannel::exception(pc, static_cast<u32>(exception));
+            parent.PrepareReschedule();
             return;
         }
 

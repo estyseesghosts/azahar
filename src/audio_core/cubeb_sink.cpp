@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 #include <cubeb/cubeb.h>
 #include "audio_core/audio_types.h"
@@ -19,6 +20,11 @@ struct CubebSink::Impl {
     cubeb_stream* stream = nullptr;
 
     std::function<void(s16*, std::size_t)> cb;
+    std::mutex callback_mutex;
+    ~Impl() {
+        if(stream){cubeb_stream_stop(stream);cubeb_stream_destroy(stream);}
+        if(ctx)cubeb_destroy(ctx);
+    }
 
     static long DataCallback(cubeb_stream* stream, void* user_data, const void* input_buffer,
                              void* output_buffer, long num_frames);
@@ -29,12 +35,12 @@ struct CubebSink::Impl {
 CubebSink::CubebSink(std::string_view target_device_name) : impl(std::make_unique<Impl>()) {
     if (cubeb_init(&impl->ctx, "Azahar Output", nullptr) != CUBEB_OK) {
         LOG_CRITICAL(Audio_Sink, "cubeb_init failed");
-        return;
+        throw std::runtime_error("audio_output_unavailable: cubeb initialization failed");
     }
 
     if (cubeb_set_log_callback(CUBEB_LOG_NORMAL, &Impl::LogCallback) != CUBEB_OK) {
         LOG_CRITICAL(Audio_Sink, "cubeb_set_log_callback failed");
-        return;
+        throw std::runtime_error("audio_output_unavailable: cubeb log callback failed");
     }
 
     cubeb_stream_params params = {
@@ -43,12 +49,10 @@ CubebSink::CubebSink(std::string_view target_device_name) : impl(std::make_uniqu
         .channels = 2,
         .layout = CUBEB_LAYOUT_STEREO,
     };
-#ifdef ENABLE_QT
     // The device's audio effects can add tens of ms of latency. Only WASAPI uses this.
     if (Settings::values.bypass_audio_effects.GetValue()) {
         params.prefs = CUBEB_STREAM_PREF_RAW;
     }
-#endif
 
     u32 minimum_latency = 100 * native_sample_rate / 1000; // Firefox default
     if (cubeb_get_min_latency(impl->ctx, &params, &minimum_latency) != CUBEB_OK) {
@@ -92,26 +96,16 @@ CubebSink::CubebSink(std::string_view target_device_name) : impl(std::make_uniqu
             LOG_CRITICAL(Audio_Sink, "Device unavailable when initializing cubeb stream");
             break;
         }
-        return;
+        throw std::runtime_error("audio_output_unavailable: cubeb stream initialization failed");
     }
 
     if (cubeb_stream_start(impl->stream) != CUBEB_OK) {
         LOG_CRITICAL(Audio_Sink, "Error starting cubeb stream");
-        return;
+        throw std::runtime_error("audio_output_unavailable: cubeb stream start failed");
     }
 }
 
 CubebSink::~CubebSink() {
-    if (impl->stream) {
-        if (cubeb_stream_stop(impl->stream) != CUBEB_OK) {
-            LOG_ERROR(Audio_Sink, "Error stopping cubeb stream.");
-        }
-        cubeb_stream_destroy(impl->stream);
-    }
-
-    if (impl->ctx) {
-        cubeb_destroy(impl->ctx);
-    }
 }
 
 unsigned int CubebSink::GetNativeSampleRate() const {
@@ -119,6 +113,7 @@ unsigned int CubebSink::GetNativeSampleRate() const {
 }
 
 void CubebSink::SetCallback(std::function<void(s16*, std::size_t)> cb) {
+    std::scoped_lock lock{impl->callback_mutex};
     impl->cb = cb;
 }
 
@@ -127,7 +122,9 @@ long CubebSink::Impl::DataCallback(cubeb_stream* stream, void* user_data, const 
     auto* impl = static_cast<Impl*>(user_data);
     auto* buffer = static_cast<s16*>(output_buffer);
 
-    if (!impl || !impl->cb) {
+    if (!impl) {std::memset(output_buffer,0,num_frames*2*sizeof(s16));return num_frames;}
+    std::scoped_lock lock{impl->callback_mutex};
+    if (!impl->cb) {
         LOG_DEBUG(Audio_Sink, "Missing internal data and/or audio callback, emitting zeroes.");
         std::memset(output_buffer, 0, num_frames * 2 * sizeof(s16));
     } else {

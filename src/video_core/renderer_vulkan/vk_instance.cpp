@@ -145,9 +145,8 @@ Instance::Instance(Frontend::EmuWindow& window, u32 physical_device_index)
       debug_callback{CreateDebugCallback(*instance, debug_utils_supported)},
       physical_devices{instance->enumeratePhysicalDevices()} {
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
-    ASSERT_MSG(physical_device_index < num_physical_devices,
-               "Invalid physical device index {} provided when only {} devices exist",
-               physical_device_index, num_physical_devices);
+    if (physical_device_index >= num_physical_devices)
+        throw std::runtime_error("Vulkan physical device is unavailable");
 
     physical_device = physical_devices[physical_device_index];
     available_extensions = GetSupportedExtensions(physical_device);

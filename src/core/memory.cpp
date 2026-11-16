@@ -19,6 +19,7 @@
 #include "core/arm/arm_interface.h"
 #include "core/arm/exception_handler.h"
 #include "core/core.h"
+#include "core/frontend/debug_channel.h"
 #ifdef ENABLE_GDBSTUB
 #include "core/gdbstub/gdbstub.h"
 #endif
@@ -567,6 +568,7 @@ void MemorySystem::UnregisterPageTable(std::shared_ptr<PageTable> page_table) {
 
 template <typename T>
 void MemorySystem::UnmappedAccess(const VAddr vaddr, const T value, bool read) {
+    if (DebugChannel::memory_fault) DebugChannel::memory_fault(vaddr,sizeof(T),!read);
     const std::string mode = (read ? "Read" : "Write");
     const std::string value_str = read ? std::string("") : fmt::format(" 0x{:08X}", value);
     const std::string message = fmt::format("unmapped {}{}{} @ 0x{:08X} at PC 0x{:08X}", mode,
@@ -647,6 +649,7 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
             GDBStub::Break(SIGTRAP);
         }
 #endif
+        if (DebugChannel::memory_access) DebugChannel::memory_access(vaddr, read_size, false);
 
         return value;
     }
@@ -668,6 +671,7 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
             GDBStub::Break(SIGTRAP);
         }
 #endif
+        if (DebugChannel::memory_access) DebugChannel::memory_access(vaddr, read_size, false);
 
         return value;
     }
@@ -735,6 +739,7 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
             GDBStub::Break(SIGTRAP);
         }
 #endif
+        if (DebugChannel::memory_access) DebugChannel::memory_access(vaddr, sizeof(T), true);
 
         break;
     }
@@ -752,6 +757,7 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
             GDBStub::Break(SIGTRAP);
         }
 #endif
+        if (DebugChannel::memory_access) DebugChannel::memory_access(vaddr, sizeof(T), true);
 
         break;
     }
@@ -793,6 +799,7 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
             GDBStub::Break(SIGTRAP);
         }
 #endif
+        if (DebugChannel::memory_access) DebugChannel::memory_access(vaddr, sizeof(T), true);
 
         return ret;
     }
@@ -812,6 +819,7 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
             GDBStub::Break(SIGTRAP);
         }
 #endif
+        if (DebugChannel::memory_access) DebugChannel::memory_access(vaddr, sizeof(T), true);
 
         return Common::AtomicCompareAndSwap(volatile_pointer, data, expected);
     }
