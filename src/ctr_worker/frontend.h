@@ -11,6 +11,7 @@
 #include "core/frontend/emu_window.h"
 #include "core/frontend/image_interface.h"
 #include "core/hle/service/service.h"
+#include "ctr_worker/debug.h"
 
 namespace CtrWorker {
 class Window final : public Frontend::EmuWindow {
@@ -58,14 +59,7 @@ inline void Initialize(Core::System& system, const std::string& root, bool& unsu
     FileUtil::SetUserPath(root + "/");
     Common::Log::Initialize();
     Common::Log::Start();
-    Settings::values.graphics_api = Settings::GraphicsAPI::Software;
-    Settings::values.is_new_3ds = false;
-    Settings::values.output_type = AudioCore::SinkType::Null;
-    Settings::values.use_gdbstub = false;
-    Settings::values.init_ticks_type = Settings::InitTicks::Fixed;
-    Settings::values.init_ticks_override = 0;
-    Settings::values.init_clock = Settings::InitClock::FixedTime;
-    Settings::values.init_time = 946684800;
+    DefaultProfile();
     for (const auto& module : Service::service_module_map)
         Settings::values.lle_modules.emplace(module.name, false);
     system.RegisterSoftwareKeyboard(std::make_shared<Keyboard>(unsupported));

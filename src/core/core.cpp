@@ -522,9 +522,14 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     }
     kernel->SetCurrentProcess(process);
     title_id = 0;
-    if (app_loader->ReadProgramId(title_id) != Loader::ResultStatus::Success) {
-        LOG_ERROR(Core, "Failed to find title id for ROM (Error {})",
-                  static_cast<u32>(load_result));
+    const auto program_id_result = app_loader->ReadProgramId(title_id);
+    if (program_id_result != Loader::ResultStatus::Success) {
+        if (app_loader->GetFileType() == Loader::FileType::THREEDSX) {
+            LOG_INFO(Core, "3DSX homebrew has no NCCH title id; continuing with id 0");
+        } else {
+            LOG_WARNING(Core, "No title id available for loaded ROM (Error {}); continuing",
+                        static_cast<u32>(program_id_result));
+        }
     }
 
     cheat_engine.LoadCheatFile(title_id);

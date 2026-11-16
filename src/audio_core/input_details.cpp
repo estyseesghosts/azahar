@@ -9,6 +9,7 @@
 #include "audio_core/input_details.h"
 #include "audio_core/null_input.h"
 #include "audio_core/static_input.h"
+#include "audio_core/injected_input.h"
 #ifdef HAVE_CUBEB
 #include "audio_core/cubeb_input.h"
 #endif
@@ -71,6 +72,9 @@ constexpr std::array input_details = {
                      return std::make_unique<NullInput>();
                  },
                  [] { return std::vector<std::string>{"None"}; }},
+    InputDetails{InputType::Injected, "Injected WAV", false,
+                 [](Core::System&,std::string_view)->std::unique_ptr<Input> { return std::make_unique<InjectedInput>(); },
+                 [] { return std::vector<std::string>{"Injected WAV"}; }},
 };
 } // Anonymous namespace
 

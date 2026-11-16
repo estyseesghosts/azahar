@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <chrono>
+#include <mutex>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/regex.hpp>
 
@@ -36,6 +37,14 @@
 #include "common/thread.h"
 
 namespace Common::Log {
+namespace {
+std::mutex observer_mutex;
+std::function<void(const Entry&)> entry_observer;
+}
+void SetObserver(std::function<void(const Entry&)> observer) {
+    std::scoped_lock lock{observer_mutex};
+    entry_observer = std::move(observer);
+}
 
 namespace {
 
@@ -351,11 +360,13 @@ public:
             return;
         }
         if (Settings::values.instant_debug_log.GetValue()) {
+            { std::scoped_lock lock{observer_mutex}; if (entry_observer) entry_observer(new_entry); }
             ForEachBackend([&new_entry](Backend& backend) {
                 backend.Write(new_entry);
                 backend.Flush();
             });
         } else {
+            { std::scoped_lock lock{observer_mutex}; if (entry_observer) entry_observer(new_entry); }
             message_queue.EmplaceWait(new_entry);
         }
     }

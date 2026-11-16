@@ -3,6 +3,7 @@
 // Refer to the LICENSE.txt file included.
 
 #pragma once
+#include <optional>
 
 #include <algorithm>
 #include <array>
@@ -309,6 +310,12 @@ public:
      *
      * @returns A reference to the default value
      */
+    /// Descriptor access for native frontend profiles; no change to application semantics.
+    [[nodiscard]] std::optional<std::pair<Type, Type>> GetRange() const {
+        if constexpr (ranged) return std::pair{minimum, maximum};
+        else return std::nullopt;
+    }
+
     [[nodiscard]] const Type& GetDefault() const {
         return default_value;
     }
@@ -677,9 +684,7 @@ struct Values {
     SwitchableSetting<float, true> volume{1.f, 0.f, 1.f, Keys::volume};
     Setting<AudioCore::SinkType> output_type{AudioCore::SinkType::Auto, Keys::output_type};
     Setting<std::string> output_device{"Auto", Keys::output_device};
-#ifdef ENABLE_QT
-    Setting<bool> bypass_audio_effects{false, Keys::bypass_audio_effects};
-#endif
+    Setting<bool> bypass_audio_effects{false, "bypass_audio_effects"};
     Setting<AudioCore::InputType> input_type{AudioCore::InputType::Auto, Keys::input_type};
     Setting<std::string> input_device{"Auto", Keys::input_device};
     SwitchableSetting<bool> simulate_headphones_plugged{false, Keys::simulate_headphones_plugged};

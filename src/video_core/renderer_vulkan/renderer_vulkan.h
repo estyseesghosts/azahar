@@ -81,6 +81,8 @@ public:
     void NotifySurfaceChanged(bool second) override;
 
     void SwapBuffers() override;
+    /// Explicit emulation-safe-point readback; never advances guest execution.
+    void CaptureOffscreen(void* pixels, const Layout::FramebufferLayout& layout);
     void TryPresent(int timeout_ms, bool is_secondary) override {}
 
 private:

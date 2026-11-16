@@ -3,6 +3,7 @@
 // Refer to the LICENSE.txt file included.
 
 #pragma once
+#include <stdexcept>
 
 #include "common/common_types.h"
 #include "core/frontend/framebuffer_layout.h"
@@ -40,6 +41,11 @@ public:
     explicit RendererBase(Core::System& system, Frontend::EmuWindow& window,
                           Frontend::EmuWindow* secondary_window);
     virtual ~RendererBase();
+
+    /// Synchronous screenshot at an emulation safe point, without advancing a guest frame.
+    virtual void CaptureOffscreen(void*, const Layout::FramebufferLayout&) {
+        throw std::runtime_error("offscreen capture unsupported by renderer");
+    }
 
     /// Returns the rasterizer owned by the renderer
     virtual VideoCore::RasterizerInterface* Rasterizer() = 0;

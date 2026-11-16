@@ -7,6 +7,7 @@
 #include "core/frontend/control_callback.h"
 #include "core/hle/kernel/kernel.h"
 #include "ctr_worker/frames.h"
+#include "ctr_worker/debug.h"
 #include "ctr_worker/frontend.h"
 #include "ctr_worker/input.h"
 #include "ctr_worker/transport.h"
@@ -75,6 +76,7 @@ public:
         Frontend::control_callback = {};
         if (system.IsPoweredOn())
             system.Shutdown();
+        AudioCore::WorkerSink::CaptureStop();
         Common::Log::Stop();
         return exit_code;
     }
@@ -82,7 +84,7 @@ public:
 private:
     Json Snapshot() {
         const auto audio = AudioCore::WorkerSink::Drain();
-        return {{"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
+        return {{"debug_api", true}, {"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
                 {"last_error", last_error},         {"input_owner", owner},
                 {"buttons", input.buttons},         {"touch_down", input.touch},
                 {"audio_samples", audio.samples},   {"audio_dropped", audio.dropped},
@@ -163,6 +165,20 @@ private:
                 Reply(request, "ok", Snapshot());
                 return;
             }
+            if (method == "debug") {
+                if (params.value("operation", "") == "input_state") {
+                    if (!system.IsPoweredOn()) throw std::invalid_argument("input requires loaded content");
+                    const auto requested = params.at("owner").get<std::string>();
+                    if ((requested!="live" && requested!="scenario") || (owner=="scenario" && requested!=owner)) {
+                        Reply(request,"permission_denied");return;
+                    }
+                    ApplyInput(input,params.at("state"));owner=requested;system.ApplySettings();
+                    Reply(request,"ok",{{"input",params.at("state")},{"owner",owner},{"safe_point",true},
+                        {"paused",state!="running"},{"rasterizer_cache_flush",false}});return;
+                }
+                Reply(request, "ok", debug.Dispatch(params, state));
+                return;
+            }
             if (method == "stop") {
                 state = "stopped";
                 if (system.IsPoweredOn())
@@ -177,6 +193,11 @@ private:
                     return;
                 }
                 const auto path = method == "load" ? params.at("path").get<std::string>() : content;
+                if(Settings::values.audio_emulation.GetValue()!=Settings::AudioEmulation::HLE &&
+                    !std::filesystem::is_regular_file(root/"sdmc/3ds/dspfirm.cdc")) {
+                    Reply(request,"not_ready",{{"error","missing_dsp_firmware"},
+                        {"required_asset","dsp_firmware"},{"session_path","sdmc/3ds/dspfirm.cdc"}});return;
+                }
                 if (path.empty() || !std::filesystem::is_regular_file(path) ||
                     std::filesystem::path(path).extension() != ".3dsx") {
                     Reply(request, "invalid_argument");
@@ -238,7 +259,7 @@ private:
                     return;
                 }
                 Reply(request, "ok",
-                      {{"frames", Capture(system, root, epoch, ++capture_sequence)},
+                      {{"frames", Capture(system, root, epoch, ++capture_sequence, params.is_object()?params.value("scale",1u):1u)},
                        {"frame", window.frames}});
             } else if (method == "input") {
                 const auto requested_owner = params.at("owner").get<std::string>();
@@ -296,6 +317,8 @@ private:
                       {{"address", address}, {"bytes", bytes}, {"safe_point", true}});
             } else
                 Reply(request, "unsupported");
+        } catch (const std::out_of_range&) {
+            Reply(request, "invalid_argument");
         } catch (const std::invalid_argument&) {
             Reply(request, "invalid_argument");
         } catch (const Json::exception&) {
@@ -315,6 +338,7 @@ private:
     Core::System& system = Core::System::GetInstance();
     std::filesystem::path root;
     Window window;
+    DebugTools debug{system, root};
     InputState input;
     std::string session, content, last_error, state = "idle", owner = "live";
     u64 epoch = 1, target = 0, capture_sequence = 0, last_request = 0;
