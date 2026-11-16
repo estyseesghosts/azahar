@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <span>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -398,7 +399,19 @@ public:
 
     std::vector<u8> SaveStateBuffer() const;
 
+    /// Phase timings of one SaveStateBuffer call (host nanoseconds, not guest time).
+    struct SaveStateTiming {
+        u64 serialize_ns = 0;
+        u64 compress_ns = 0;
+        u64 serialized_bytes = 0;
+    };
+    /// Same format as SaveStateBuffer(); `compression_level` trades size for time and every
+    /// level decompresses to the same serialized bytes.
+    std::vector<u8> SaveStateBuffer(int compression_level, SaveStateTiming* timing) const;
+
     bool LoadStateBuffer(std::vector<u8> buffer);
+    /// As above without copying the caller's buffer.
+    bool LoadStateBuffer(std::span<const u8> buffer);
 
     /// Applies any changes to settings to this core instance.
     void ApplySettings();

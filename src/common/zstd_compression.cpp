@@ -48,6 +48,33 @@ std::vector<u8> CompressDataZSTD(std::span<const u8> source, s32 compression_lev
     return compressed;
 }
 
+std::vector<u8> CompressDataZSTDAfter(std::span<const u8> prefix, std::span<const u8> source,
+                                      s32 compression_level) {
+    compression_level = std::clamp(compression_level, ZSTD_minCLevel(), ZSTD_maxCLevel());
+    const std::size_t bound = ZSTD_compressBound(source.size());
+    if (ZSTD_isError(bound)) {
+        LOG_ERROR(Common, "Error determining ZSTD maximum compressed size: {} ({})",
+                  ZSTD_getErrorName(bound), bound);
+        return {};
+    }
+    const std::unique_ptr<u8[]> scratch{new u8[bound]};
+    const std::size_t size =
+        ZSTD_compress(scratch.get(), bound, source.data(), source.size(), compression_level);
+    if (ZSTD_isError(size)) {
+        LOG_ERROR(Common, "Error compressing ZSTD data: {} ({})", ZSTD_getErrorName(size), size);
+        return {};
+    }
+    std::vector<u8> out;
+    out.reserve(prefix.size() + size);
+    out.insert(out.end(), prefix.begin(), prefix.end());
+    out.insert(out.end(), scratch.get(), scratch.get() + size);
+    return out;
+}
+
+s32 DefaultCompressionLevel() {
+    return ZSTD_CLEVEL_DEFAULT;
+}
+
 std::vector<u8> CompressDataZSTDDefault(std::span<const u8> source) {
     return CompressDataZSTD(source, ZSTD_CLEVEL_DEFAULT);
 }

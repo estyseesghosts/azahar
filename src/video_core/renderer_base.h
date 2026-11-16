@@ -47,6 +47,15 @@ public:
         throw std::runtime_error("offscreen capture unsupported by renderer");
     }
 
+    /// Live-preview readback for `stream` (one per screen). May return an earlier request's
+    /// pixels instead of waiting for the GPU; returns the `frame_id` the pixels belong to.
+    /// The default is the synchronous capture.
+    virtual u64 PreviewOffscreen(void* pixels, const Layout::FramebufferLayout& layout, u32 stream,
+                                 u64 frame_id) {
+        CaptureOffscreen(pixels, layout);
+        return frame_id;
+    }
+
     /// Returns the rasterizer owned by the renderer
     virtual VideoCore::RasterizerInterface* Rasterizer() = 0;
 

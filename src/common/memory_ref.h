@@ -132,6 +132,15 @@ public:
         return MemoryRef(backing_mem, offset + offset_by);
     }
 
+    /// Backing object and byte offset, for compact serialization of runs of references.
+    const std::shared_ptr<BackingMem>& GetBackingMem() const {
+        return backing_mem;
+    }
+
+    u64 GetOffset() const {
+        return offset;
+    }
+
 private:
     std::shared_ptr<BackingMem> backing_mem{};
     u64 offset{};

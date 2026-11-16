@@ -6,9 +6,13 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/vector.hpp>
+#include <boost/serialization/version.hpp>
 #include "common/common_types.h"
 #include "common/memory_ref.h"
 #include "common/swap.h"
@@ -131,15 +135,82 @@ struct PageTable {
     void Clear();
 
 private:
+    // Version 0 stored every entry: 2^20 tracked shared_ptr references and 2^20 attributes, which
+    // dominated savestate time. Version 1 stores runs of pages that share an attribute and a
+    // backing object at consecutive page offsets. A null reference always has offset 0
+    // (common/memory_ref.h constructors), so a null run has step 0.
     template <class Archive>
-    void serialize(Archive& ar, const unsigned int) {
-        ar & pointers.refs;
-        ar & attributes;
+    void serialize(Archive& ar, const unsigned int file_version) {
+        if constexpr (Archive::is_saving::value) {
+            SaveRuns(ar);
+        } else if (file_version == 0) {
+            ar & pointers.refs;
+            ar & attributes;
+        } else {
+            LoadRuns(ar);
+        }
         ar & watchpoint_pages_map;
         for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
             pointers.raw[i] = pointers.refs[i].GetPtr();
         }
     }
+
+    template <class Archive>
+    void SaveRuns(Archive& ar) const {
+        const auto& refs = pointers.refs;
+        std::vector<std::pair<u32, u32>> runs; // first page, page count
+        for (std::size_t first = 0; first < PAGE_TABLE_NUM_ENTRIES;) {
+            const auto& mem = refs[first].GetBackingMem();
+            const u64 offset = refs[first].GetOffset();
+            const u64 step = mem ? CITRA_PAGE_SIZE : 0;
+            std::size_t end = first + 1;
+            while (end < PAGE_TABLE_NUM_ENTRIES && attributes[end] == attributes[first] &&
+                   refs[end].GetBackingMem() == mem &&
+                   refs[end].GetOffset() == offset + (end - first) * step) {
+                ++end;
+            }
+            runs.emplace_back(static_cast<u32>(first), static_cast<u32>(end - first));
+            first = end;
+        }
+        const u32 count = static_cast<u32>(runs.size());
+        ar << count;
+        for (const auto& [first, length] : runs) {
+            const u8 attribute = static_cast<u8>(attributes[first]);
+            const u64 offset = refs[first].GetOffset();
+            ar << first << length << attribute << refs[first].GetBackingMem() << offset;
+        }
+    }
+
+    template <class Archive>
+    void LoadRuns(Archive& ar) {
+        u32 count{};
+        ar >> count;
+        std::size_t next = 0;
+        for (u32 run = 0; run < count; ++run) {
+            u32 first{}, length{};
+            u8 attribute{};
+            std::shared_ptr<BackingMem> mem;
+            u64 offset{};
+            ar >> first >> length >> attribute >> mem >> offset;
+            if (first != next || length == 0 || length > PAGE_TABLE_NUM_ENTRIES - first ||
+                attribute > static_cast<u8>(PageType::RasterizerCachedMemoryWatchpoint) ||
+                (!mem && offset != 0) ||
+                (mem && (offset > mem->GetSize() ||
+                         u64{length - 1} * CITRA_PAGE_SIZE > mem->GetSize() - offset))) {
+                throw std::runtime_error("Invalid page table run in save state");
+            }
+            for (u32 page = 0; page < length; ++page) {
+                pointers.refs[first + page] =
+                    mem ? MemoryRef(mem, offset + u64{page} * CITRA_PAGE_SIZE) : MemoryRef{};
+                attributes[first + page] = static_cast<PageType>(attribute);
+            }
+            next = first + length;
+        }
+        if (next != PAGE_TABLE_NUM_ENTRIES) {
+            throw std::runtime_error("Incomplete page table in save state");
+        }
+    }
+
     friend class boost::serialization::access;
 };
 
@@ -766,6 +837,7 @@ public:
 
 } // namespace Memory
 
+BOOST_CLASS_VERSION(Memory::PageTable, 1)
 BOOST_CLASS_EXPORT_KEY(Memory::MemorySystem::BackingMemImpl<Memory::Region::FCRAM>)
 BOOST_CLASS_EXPORT_KEY(Memory::MemorySystem::BackingMemImpl<Memory::Region::VRAM>)
 BOOST_CLASS_EXPORT_KEY(Memory::MemorySystem::BackingMemImpl<Memory::Region::DSP>)

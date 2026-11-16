@@ -140,6 +140,12 @@ RendererVulkan::~RendererVulkan() {
     scheduler.Finish();
     main_present_window.WaitPresent();
     device.waitIdle();
+    for (auto& ring : preview_slots) {
+        for (auto& slot : ring) {
+            slot.pending = false;
+            DestroyPreviewSlot(slot);
+        }
+    }
 
     device.destroyShaderModule(present_vertex_shader);
     for (u32 i = 0; i < PRESENT_PIPELINES; i++) {
@@ -1198,6 +1204,95 @@ void RendererVulkan::CaptureOffscreen(void* pixels, const Layout::FramebufferLay
     if (!complete) throw std::runtime_error("offscreen readback failed");
 }
 
+u64 RendererVulkan::PreviewOffscreen(void* pixels, const Layout::FramebufferLayout& layout,
+                                     u32 stream, u64 frame_id) {
+    if (stream >= preview_slots.size()) {
+        throw std::invalid_argument("preview stream");
+    }
+    auto& ring = preview_slots[stream];
+    PreviewSlot& slot = ring[preview_next[stream]];
+    PreviewSlot& previous = ring[preview_next[stream] ^ 1];
+    const u32 width = layout.width;
+    const u32 height = layout.height;
+    // This slot was submitted two requests ago; its copy has normally finished.
+    if (slot.pending) {
+        scheduler.Wait(slot.tick);
+        slot.pending = false;
+    }
+    ResizePreviewSlot(slot, width, height);
+    PrepareRendertarget();
+    DrawScreens(&slot.frame, layout, false);
+    RecordFrameCopy(slot.frame, slot.buffer, width, height);
+    // Same tick bookkeeping as Scheduler::Finish, without waiting here.
+    slot.tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    slot.frame_id = frame_id;
+    slot.pending = true;
+    preview_next[stream] ^= 1;
+
+    PreviewSlot* source = &slot;
+    if (previous.pending && previous.frame_id != frame_id && previous.size == slot.size) {
+        source = &previous;
+    }
+    scheduler.Wait(source->tick);
+    // AUTO_PREFER_HOST may pick non-coherent memory; make the GPU writes visible.
+    vmaInvalidateAllocation(instance.GetAllocator(), source->allocation, 0, VK_WHOLE_SIZE);
+    std::memcpy(pixels, source->mapped, source->size);
+    if (main_present_window.GetSurfaceFormat() == vk::Format::eR8G8B8A8Unorm) {
+        u8* bytes = static_cast<u8*>(pixels);
+        for (u64 i = 0; i < source->size / 4; i++) {
+            std::swap(bytes[i * 4 + 0], bytes[i * 4 + 2]);
+        }
+    }
+    return source->frame_id;
+}
+
+void RendererVulkan::ResizePreviewSlot(PreviewSlot& slot, u32 width, u32 height) {
+    const u64 size = u64{width} * height * 4;
+    if (slot.size == size && slot.frame.width == width && slot.frame.height == height) {
+        return;
+    }
+    DestroyPreviewSlot(slot);
+    main_present_window.RecreateFrame(&slot.frame, width, height);
+    const VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    const VmaAllocationCreateInfo alloc_create_info = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+    };
+    VmaAllocationInfo alloc_info{};
+    if (vmaCreateBuffer(instance.GetAllocator(), &buffer_info, &alloc_create_info, &slot.buffer,
+                        &slot.allocation, &alloc_info) != VK_SUCCESS) {
+        throw std::runtime_error("preview staging allocation failed");
+    }
+    slot.mapped = alloc_info.pMappedData;
+    slot.size = size;
+}
+
+void RendererVulkan::DestroyPreviewSlot(PreviewSlot& slot) {
+    const vk::Device device = instance.GetDevice();
+    if (slot.pending) {
+        scheduler.Wait(slot.tick);
+    }
+    if (slot.buffer) {
+        vmaDestroyBuffer(instance.GetAllocator(), slot.buffer, slot.allocation);
+    }
+    if (slot.frame.framebuffer) {
+        device.destroyFramebuffer(slot.frame.framebuffer);
+    }
+    if (slot.frame.image_view) {
+        device.destroyImageView(slot.frame.image_view);
+    }
+    if (slot.frame.image) {
+        vmaDestroyImage(instance.GetAllocator(), slot.frame.image, slot.frame.allocation);
+    }
+    slot = PreviewSlot{};
+}
+
 void RendererVulkan::RenderScreenshot() {
     if (!settings.screenshot_requested.exchange(false)) {
         return;
@@ -1210,49 +1305,10 @@ void RendererVulkan::RenderScreenshot() {
     settings.screenshot_complete_callback(false);
 }
 
-void RendererVulkan::RenderScreenshotWithStagingCopy() {
-    const vk::Device device = instance.GetDevice();
-
-    const Layout::FramebufferLayout layout{settings.screenshot_framebuffer_layout};
-    const u32 width = layout.width;
-    const u32 height = layout.height;
-
-    const vk::BufferCreateInfo staging_buffer_info = {
-        .size = width * height * 4,
-        .usage = vk::BufferUsageFlagBits::eTransferDst,
-    };
-
-    const VmaAllocationCreateInfo alloc_create_info = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT |
-                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-        .requiredFlags = 0,
-        .preferredFlags = 0,
-        .pool = VK_NULL_HANDLE,
-        .pUserData = nullptr,
-    };
-
-    VkBuffer unsafe_buffer{};
-    VmaAllocation allocation{};
-    VmaAllocationInfo alloc_info;
-    VkBufferCreateInfo unsafe_buffer_info = static_cast<VkBufferCreateInfo>(staging_buffer_info);
-
-    VkResult result = vmaCreateBuffer(instance.GetAllocator(), &unsafe_buffer_info,
-                                      &alloc_create_info, &unsafe_buffer, &allocation, &alloc_info);
-    if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}", result);
-        UNREACHABLE();
-    }
-
-    vk::Buffer staging_buffer{unsafe_buffer};
-
-    Frame frame{};
-    main_present_window.RecreateFrame(&frame, width, height);
-
-    DrawScreens(&frame, layout, false);
-
+void RendererVulkan::RecordFrameCopy(const Frame& frame, vk::Buffer buffer, u32 width,
+                                     u32 height) {
     scheduler.Record(
-        [width, height, source_image = frame.image, staging_buffer](vk::CommandBuffer cmdbuf) {
+        [width, height, source_image = frame.image, staging_buffer = buffer](vk::CommandBuffer cmdbuf) {
             const vk::ImageMemoryBarrier read_barrier = {
                 .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
                 .dstAccessMask = vk::AccessFlagBits::eTransferRead,
@@ -1314,6 +1370,50 @@ void RendererVulkan::RenderScreenshotWithStagingCopy() {
                 vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
                 vk::DependencyFlagBits::eByRegion, memory_write_barrier, {}, write_barrier);
         });
+}
+
+void RendererVulkan::RenderScreenshotWithStagingCopy() {
+    const vk::Device device = instance.GetDevice();
+
+    const Layout::FramebufferLayout layout{settings.screenshot_framebuffer_layout};
+    const u32 width = layout.width;
+    const u32 height = layout.height;
+
+    const vk::BufferCreateInfo staging_buffer_info = {
+        .size = width * height * 4,
+        .usage = vk::BufferUsageFlagBits::eTransferDst,
+    };
+
+    const VmaAllocationCreateInfo alloc_create_info = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .requiredFlags = 0,
+        .preferredFlags = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+    };
+
+    VkBuffer unsafe_buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo alloc_info;
+    VkBufferCreateInfo unsafe_buffer_info = static_cast<VkBufferCreateInfo>(staging_buffer_info);
+
+    VkResult result = vmaCreateBuffer(instance.GetAllocator(), &unsafe_buffer_info,
+                                      &alloc_create_info, &unsafe_buffer, &allocation, &alloc_info);
+    if (result != VK_SUCCESS) [[unlikely]] {
+        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}", result);
+        UNREACHABLE();
+    }
+
+    vk::Buffer staging_buffer{unsafe_buffer};
+
+    Frame frame{};
+    main_present_window.RecreateFrame(&frame, width, height);
+
+    DrawScreens(&frame, layout, false);
+
+    RecordFrameCopy(frame, staging_buffer, width, height);
 
     // Ensure the copy is fully completed before saving the screenshot
     scheduler.Finish();

@@ -83,6 +83,11 @@ public:
     void SwapBuffers() override;
     /// Explicit emulation-safe-point readback; never advances guest execution.
     void CaptureOffscreen(void* pixels, const Layout::FramebufferLayout& layout);
+    /// Double-buffered per stream: submits a copy of the current frame and returns the previous
+    /// request's copy when it shows an older frame, so only that older submission is waited on.
+    /// Returns the current frame (waiting for it) when nothing was presented since.
+    u64 PreviewOffscreen(void* pixels, const Layout::FramebufferLayout& layout, u32 stream,
+                         u64 frame_id) override;
     void TryPresent(int timeout_ms, bool is_secondary) override {}
 
 private:
@@ -97,6 +102,21 @@ private:
     void LimitFramesAheadOfGpu() override;
     void RenderScreenshot();
     void RenderScreenshotWithStagingCopy();
+    struct PreviewSlot {
+        Frame frame{};
+        VkBuffer buffer{};
+        VmaAllocation allocation{};
+        void* mapped{};
+        u64 size{};
+        u64 tick{};
+        u64 frame_id{};
+        bool pending{};
+    };
+    void RecordFrameCopy(const Frame& frame, vk::Buffer buffer, u32 width, u32 height);
+    void ResizePreviewSlot(PreviewSlot& slot, u32 width, u32 height);
+    void DestroyPreviewSlot(PreviewSlot& slot);
+    std::array<std::array<PreviewSlot, 2>, 2> preview_slots{};
+    std::array<u32, 2> preview_next{};
     bool TryRenderScreenshotWithHostMemory();
     void PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout);
     void RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,

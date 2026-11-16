@@ -1,10 +1,12 @@
 // Worker-side settings and safe-point inspection. No product/UI dependencies.
 #pragma once
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <fstream>
 #include <map>
 #include <set>
+#include <span>
 #include <boost/regex.hpp>
 #include <cryptopp/sha.h>
 #include "common/hash.h"
@@ -248,7 +250,7 @@ public:
         }
         breakpoints.clear();
         scan.clear();
-        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;hits_untracked=false;
+        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;hits_untracked=false;history_level=3;checkpoint_stats={};
         replaying=false;position_at_hit=false;
         predicate=nullptr;
         hio_pending = 0;
@@ -395,8 +397,12 @@ public:
         if(!core)history_force=false;
         if(system.Kernel().AreAsyncOperationsPending()){++history_lost;return;}
         ArmWatches(false);std::vector<u8> bytes;
-        try {bytes=system.SaveStateBuffer();}catch(...){ArmWatches(true);throw;}
+        Core::System::SaveStateTiming timing;
+        try {bytes=system.SaveStateBuffer(history_level,&timing);}catch(...){ArmWatches(true);throw;}
         ArmWatches(true);
+        ++checkpoint_stats.count;checkpoint_stats.serialize_ns+=timing.serialize_ns;
+        checkpoint_stats.compress_ns+=timing.compress_ns;checkpoint_stats.serialized_bytes+=timing.serialized_bytes;
+        checkpoint_stats.stored_bytes+=bytes.size();
         if(bytes.size()>history_budget)throw std::invalid_argument("single snapshot exceeds rewind memory budget");
         while(!history.empty() && (history.size()>=history_capacity || history_bytes+bytes.size()>history_budget)) {
             history_bytes-=history.front().bytes.size();history.pop_front();++history_lost;
@@ -408,10 +414,24 @@ public:
                            skip_core,skip_pc});
         hits_untracked=false;
     }
+    bool Restore(const std::vector<u8>& bytes) {
+        const auto start=std::chrono::steady_clock::now();
+        const bool ok=system.LoadStateBuffer(std::span<const u8>{bytes});
+        ++checkpoint_stats.restores;
+        checkpoint_stats.restore_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+        return ok;
+    }
     void MarkHistoryStop() { if(rewind_enabled && stopped && !history.empty())history.back().stop=stop_reason; }
     Json HistoryStatus() const {
         return {{"enabled",rewind_enabled},{"interval_frames",history_interval},{"snapshots",history.size()},{"bytes",history_bytes},
             {"capacity",history_capacity},{"budget_bytes",history_budget},{"lost_snapshots",history_lost},
+            {"compression_level",history_level},
+            // Host nanoseconds since rewind_configure: checkpoint phases and restores.
+            {"checkpoints",checkpoint_stats.count},{"checkpoint_serialize_ns",checkpoint_stats.serialize_ns},
+            {"checkpoint_compress_ns",checkpoint_stats.compress_ns},
+            {"checkpoint_serialized_bytes",checkpoint_stats.serialized_bytes},
+            {"checkpoint_stored_bytes",checkpoint_stats.stored_bytes},
+            {"restores",checkpoint_stats.restores},{"restore_ns",checkpoint_stats.restore_ns},
             {"instruction_history","explicit step operations; continuous execution records frame safe points"},
             {"reverse_continue","replays from frame or instruction checkpoints with instruction stepping; lands before the previous breakpoint or watchpoint access"}};
     }
@@ -428,7 +448,7 @@ public:
         if(!core && entry.stop.empty())throw std::invalid_argument("no recorded debugger stop in rewind history");
         if(entry.settings!=SettingsSnapshot())throw std::invalid_argument("rewind profile changed");
         const bool trace=trace_svc;SetTrace(false);ArmWatches(false);
-        if(!system.LoadStateBuffer(entry.bytes))throw std::runtime_error("rewind restore failed");
+        if(!Restore(entry.bytes))throw std::runtime_error("rewind restore failed");
         ArmWatches(true);if(trace)SetTrace(true);
         for(u32 i=0;i<system.GetNumCores();++i){system.GetCore(i).ClearInstructionCache();system.GetCore(i).ClearBreakFlag();}
         stopped=false;skip_core=0xffffffff;
@@ -484,7 +504,7 @@ public:
         const bool trace = trace_svc;
         SetTrace(false);
         ArmWatches(false);
-        if (!system.LoadStateBuffer(entry.bytes)) throw std::runtime_error("rewind restore failed");
+        if (!Restore(entry.bytes)) throw std::runtime_error("rewind restore failed");
         ArmWatches(true);
         if (trace) SetTrace(true);
         for (u32 i = 0; i < system.GetNumCores(); ++i) {
@@ -1118,8 +1138,11 @@ public:
                 if(!capacity||capacity>128||budget<16||budget>256)throw std::invalid_argument("invalid rewind budget");
                 const auto interval=p.value("interval_frames",1u);
                 if(!interval||interval>60)throw std::invalid_argument("rewind interval 1..60 frames");
+                // zstd level of rewind checkpoints only; every level restores the same state.
+                const auto level=p.value("compression_level",3);
+                if(level<-7||level>19)throw std::invalid_argument("rewind compression_level -7..19");
                 rewind_enabled=p.at("enabled");history_capacity=capacity;history_budget=u64(budget)<<20;
-                history_interval=interval;history_force=false;
+                history_interval=interval;history_force=false;history_level=level;checkpoint_stats={};
                 history.clear();history_bytes=history_lost=0;history_frame=~0ull;return HistoryStatus();
             }
             if(op=="reverse_step")return Reverse(p.at("core").get<u32>());
@@ -1495,6 +1518,8 @@ private:
     bool rewind_enabled=false;
     size_t history_capacity=32;
     u64 history_bytes=0,history_budget=64u<<20,history_lost=0,history_frame=~0ull,history_interval=1;
+    int history_level=3; // ZSTD_CLEVEL_DEFAULT, what SaveStateBuffer() uses
+    struct {u64 count=0,serialize_ns=0,compress_ns=0,serialized_bytes=0,stored_bytes=0,restores=0,restore_ns=0;} checkpoint_stats;
     bool history_force=false;
     std::vector<Candidate> scan;
     u32 scan_width = 0;

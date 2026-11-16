@@ -114,7 +114,8 @@ private:
                 {"buttons", input.buttons},         {"touch_down", input.touch},
                 {"audio_samples", audio.samples},   {"audio_dropped", audio.dropped},
                 {"audio_focused", AudioCore::WorkerSink::focused},
-                {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered}};
+                {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered},
+                {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"}};
     }
     void Reply(const Json& request, const std::string& status, Json data = nullptr) {
         Send({{"version_major", 1},
@@ -336,6 +337,16 @@ private:
                 Reply(request, "ok",
                       {{"frames", Capture(system, root, epoch, ++capture_sequence, params.is_object()?params.value("scale",1u):1u)},
                        {"frame", window.frames}});
+            } else if (method == "preview") {
+                if (!PreviewRing::Supported()) {
+                    Reply(request, "unsupported");
+                    return;
+                }
+                if (!window.frames) {
+                    Reply(request, "not_ready");
+                    return;
+                }
+                Reply(request, "ok", preview.Write(system, epoch, window.frames));
             } else if (method == "input") {
                 if((system.Movie().GetPlayMode()==Core::Movie::PlayMode::Playing || system.Movie().GetPlayMode()==Core::Movie::PlayMode::MovieFinished))throw std::invalid_argument("movie playback owns input");
                 const auto requested_owner = params.at("owner").get<std::string>();
@@ -419,6 +430,7 @@ private:
     InputState input;
     std::string session, content, last_error, state = "idle", owner = "live";
     u64 epoch = 1, target = 0, capture_sequence = 0, last_request = 0;
+    PreviewRing preview;
     bool unsupported = false, notifications = false;
     int exit_code = 0;
     std::chrono::steady_clock::time_point deadline;

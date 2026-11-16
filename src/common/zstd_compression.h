@@ -39,6 +39,18 @@ namespace Common::Compression {
  */
 [[nodiscard]] std::vector<u8> CompressDataZSTDDefault(std::span<const u8> source);
 
+/// ZSTD_CLEVEL_DEFAULT, the level CompressDataZSTDDefault uses.
+[[nodiscard]] s32 DefaultCompressionLevel();
+
+/**
+ * Returns `prefix` followed by the Zstandard frame of `source`. The worst-case scratch buffer is
+ * left uninitialised and only the compressed bytes are copied, so large inputs avoid a
+ * bound-sized memset and a second copy. Any level decompresses with DecompressDataZSTD.
+ */
+[[nodiscard]] std::vector<u8> CompressDataZSTDAfter(std::span<const u8> prefix,
+                                                    std::span<const u8> source,
+                                                    s32 compression_level);
+
 /**
  * Gets the decompressed size of the specified Zstandard compressed memory region.
  *
