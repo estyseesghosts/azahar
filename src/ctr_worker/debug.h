@@ -742,7 +742,18 @@ public:
                     if(std::filesystem::file_size(path)>(32u<<20)+4096 || movie.ValidateMovie(path.string())!=Core::Movie::ValidationResult::OK)
                         throw std::invalid_argument("incompatible or invalid movie");
                     Json meta;std::ifstream(root/"movies"/(name+".json"))>>meta;
-                    if(meta.at("source")!=CTR_SOURCE_SHA || meta.at("settings")!=SettingsSnapshot())throw std::invalid_argument("movie profile or pin mismatch");
+                    // A movie carries its console identity (CFG save data, e.g. the
+                    // per-root random console ID); apply it, roll back on mismatch.
+                    std::vector<std::pair<SettingBinding*,Json>> previous;
+                    const auto& recorded=meta.at("settings");
+                    for(auto& b:bindings)
+                        if(std::string{b.apply}=="cfg-savedata"&&recorded.contains(b.name)&&recorded.at(b.name)!=b.get()) {
+                            previous.emplace_back(&b,b.get());b.set(recorded.at(b.name));
+                        }
+                    if(meta.at("source")!=CTR_SOURCE_SHA || recorded!=SettingsSnapshot()) {
+                        for(auto it=previous.rbegin();it!=previous.rend();++it)it->first->set(it->second);
+                        throw std::invalid_argument("movie profile or pin mismatch");
+                    }
                     movie.SetReadOnly(p.at("read_only"));
                 }
                 movie_name=name;movie_plan=op=="movie_record"?"record":"play";
