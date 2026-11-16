@@ -5,6 +5,7 @@
 #pragma once
 
 #include <vector>
+#include <array>
 #include "common/common_types.h"
 #include "common/vector_math.h"
 #include "video_core/pica_types.h"
@@ -78,6 +79,7 @@ struct DebugData<true> {
     u32 max_opdesc_id = 0; ///< maximum swizzle pattern index ever used
 
     bool truncated = false;
+    std::array<std::array<u32,4>,16> output_f32_bits{};
     /// List of records for each executed shader instruction
     std::vector<DebugData<true>::Record> records;
 };

@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <numeric>
 #include <boost/circular_buffer.hpp>
@@ -14,6 +15,7 @@
 #include "common/microprofile.h"
 #include "common/vector_math.h"
 #include "video_core/pica/shader_setup.h"
+#include "video_core/pica/regs_shader.h"
 #include "video_core/pica/shader_unit.h"
 #include "video_core/pica_types.h"
 #include "video_core/shader/shader_interpreter.h"
@@ -765,7 +767,10 @@ DebugData<true> InterpreterEngine::ProduceDebugInfo(const ShaderSetup& setup,
     // Setup input register table
     state.input.fill(Common::Vec4<f24>::AssignToAll(f24::Zero()));
     state.LoadInput(config, input);
-    RunInterpreter(setup, state, debug_data, setup.entry_point);
+    RunInterpreter(setup, state, debug_data, config.main_offset);
+    AttributeBuffer output{};state.WriteOutput(config,output);
+    for(u32 i=0;i<16;++i)for(u32 c=0;c<4;++c)
+        debug_data.output_f32_bits[i][c]=std::bit_cast<u32>(output[i][c].ToFloat32());
     return debug_data;
 }
 

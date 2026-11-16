@@ -16,5 +16,6 @@ inline std::function<void(u32,u32,bool)> memory_fault;
 inline std::function<void(u32)> svc_break;
 inline std::function<void(u32,const void*)> gpu_event;
 inline std::function<void(u32,u32)> gpu_action; // frame, command list, fill, transfer
+inline std::function<void(const void*)> gpu_vertex_output;
 inline bool single_step = false;
 }

@@ -1049,7 +1049,7 @@ void PicaCore::DrawArrays(bool is_indexed) {
 
     // Track vertex in the debug recorder.
     if (debug_context) {
-        debug_context->OnEvent(DebugContext::Event::IncomingPrimitiveBatch, nullptr);
+        debug_context->OnEvent(DebugContext::Event::IncomingPrimitiveBatch, &is_indexed);
     }
 
     const bool accelerate_draw = [this] {
@@ -1166,6 +1166,7 @@ void PicaCore::LoadVertices(bool is_indexed) {
             shader_unit.LoadInput(regs.internal.vs, input);
             shader_engine->Run(vs_setup, shader_unit);
             shader_unit.WriteOutput(regs.internal.vs, vs_output);
+            if (DebugChannel::gpu_vertex_output) DebugChannel::gpu_vertex_output(&vs_output);
 
             // Cache the vertex when doing indexed rendering.
             if (is_indexed) {
