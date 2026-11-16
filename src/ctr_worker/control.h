@@ -7,6 +7,7 @@
 #include "core/frontend/control_callback.h"
 #include "core/hle/kernel/kernel.h"
 #include "ctr_worker/frames.h"
+#include "ctr_worker/camera.h"
 #include "ctr_worker/debug.h"
 #include "ctr_worker/frontend.h"
 #include "ctr_worker/input.h"
@@ -21,6 +22,7 @@ public:
         ReserveControlOutput();
         Initialize(system, root.string(), unsupported);
         RegisterInput(input);
+        RegisterCamera();
         Settings::values.output_type = AudioCore::SinkType::Worker;
         Frontend::control_callback = [this] { Drain(true); };
         std::thread reader{[this] {

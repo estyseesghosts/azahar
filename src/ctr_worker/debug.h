@@ -10,6 +10,7 @@
 #include "audio_core/injected_input.h"
 #include "core/hle/service/mic/mic_u.h"
 #include "core/hle/service/nfc/nfc.h"
+#include "ctr_worker/camera.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/thread.h"
@@ -185,6 +186,9 @@ public:
                 if(!service)throw std::invalid_argument("NFC service unavailable");
                 if(op=="nfc_remove")service->RemoveAmiibo();
                 else if(!service->LoadAmiibo((root/"media/nfc.bin").string()))throw std::invalid_argument("invalid NFC asset");
+            } else if(kind=="camera_bmp") {
+                auto mounted=MountCamera(system,root);mounted["mounted"]=kind;mounted["session_private"]=true;
+                return mounted;
             } else if(kind=="mic_wav") {
                 AudioCore::InjectedInput::Load(root/"media/mic.wav");
                 Settings::values.input_type=AudioCore::InputType::Injected;
