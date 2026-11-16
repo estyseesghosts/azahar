@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <cstring>
+#include <stdexcept>
 #include "common/assert.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
@@ -14,7 +15,7 @@ Recorder::Recorder(const InitialState& initial_state) : initial_state(initial_st
 
 void Recorder::Finish(const std::string& filename) {
     // Setup CiTrace header
-    CTHeader header;
+    CTHeader header{};
     std::memcpy(header.magic, CTHeader::ExpectedMagicWord(), 4);
     header.version = CTHeader::ExpectedVersion();
     header.header_size = sizeof(CTHeader);
@@ -36,7 +37,6 @@ void Recorder::Finish(const std::string& filename) {
     initial.gpu_registers = sizeof(header);
     initial.lcd_registers = initial.gpu_registers + initial.gpu_registers_size * sizeof(u32);
     initial.pica_registers = initial.lcd_registers + initial.lcd_registers_size * sizeof(u32);
-    ;
     initial.default_attributes = initial.pica_registers + initial.pica_registers_size * sizeof(u32);
     initial.vs_program_binary =
         initial.default_attributes + initial.default_attributes_size * sizeof(u32);
@@ -52,24 +52,13 @@ void Recorder::Finish(const std::string& filename) {
         initial.gs_swizzle_data + initial.gs_swizzle_data_size * sizeof(u32);
     header.stream_offset = initial.gs_float_uniforms + initial.gs_float_uniforms_size * sizeof(u32);
 
-    // Iterate through stream elements, update relevant stream element data
-    for (auto& stream_element : stream) {
-        switch (stream_element.data.type) {
-        case MemoryLoad: {
-            auto& file_offset = memory_regions[stream_element.hash];
-            if (!stream_element.uses_existing_data) {
-                file_offset = header.stream_offset;
-            }
-            stream_element.data.memory_load.file_offset = file_offset;
-            break;
+    // Offsets refer to exact, byte-compared payloads. CRC collisions never alias data.
+    for (auto& element : stream) {
+        if (element.data.type == MemoryLoad) {
+            element.data.memory_load.file_offset = element.uses_existing_data
+                ? stream.at(element.source_index).data.memory_load.file_offset : header.stream_offset;
         }
-
-        default:
-            // Other commands don't use any extra data
-            DEBUG_ASSERT(stream_element.extra_data.size() == 0);
-            break;
-        }
-        header.stream_offset += static_cast<u32>(stream_element.extra_data.size());
+        header.stream_offset += static_cast<u32>(element.extra_data.size());
     }
 
     try {
@@ -80,16 +69,12 @@ void Recorder::Finish(const std::string& filename) {
             throw "Failed to write header";
 
         // Write initial state
-        written = file.WriteArray(initial_state.pica_registers.data(),
-                                  initial_state.pica_registers.size());
-        if (written != initial_state.pica_registers.size() ||
-            file.Tell() != initial.default_attributes)
-            throw "Failed to write Pica registers";
-
-        written =
-            file.WriteArray(initial_state.lcd_registers.data(), initial_state.lcd_registers.size());
+        written = file.WriteArray(initial_state.lcd_registers.data(), initial_state.lcd_registers.size());
         if (written != initial_state.lcd_registers.size() || file.Tell() != initial.pica_registers)
             throw "Failed to write LCD registers";
+        written = file.WriteArray(initial_state.pica_registers.data(), initial_state.pica_registers.size());
+        if (written != initial_state.pica_registers.size() || file.Tell() != initial.default_attributes)
+            throw "Failed to write Pica registers";
 
         written = file.WriteArray(initial_state.default_attributes.data(),
                                   initial_state.default_attributes.size());
@@ -153,40 +138,45 @@ void Recorder::Finish(const std::string& filename) {
                 throw "Failed to write stream element";
         }
     } catch (const char* str) {
-        LOG_ERROR(HW_GPU, "Writing CiTrace file failed: {}", str);
+        throw std::runtime_error(str);
     }
 }
 
 void Recorder::FrameFinished() {
-    stream.push_back({{FrameMarker}});
+    if (Room()) stream.push_back({{FrameMarker}});
 }
 
 void Recorder::MemoryAccessed(const u8* data, u32 size, u32 physical_address) {
+    if (!Room()) return;
     StreamElement element = {{MemoryLoad}};
     element.data.memory_load.size = size;
     element.data.memory_load.physical_address = physical_address;
-
-    // Compute hash over given memory region to check if the contents are already stored internally
     boost::crc_32_type result;
     result.process_bytes(data, size);
     element.hash = result.checksum();
-
-    element.uses_existing_data = (memory_regions.find(element.hash) != memory_regions.end());
-    if (!element.uses_existing_data) {
-        element.extra_data.resize(size);
-        std::memcpy(element.extra_data.data(), data, size);
-        memory_regions.insert({element.hash, 0}); // file offset will be initialized in Finish()
+    auto& candidates = memory_regions[element.hash];
+    for (auto index : candidates) {
+        const auto& bytes = stream[index].extra_data;
+        if (bytes.size() == size && std::memcmp(bytes.data(), data, size) == 0) {
+            element.uses_existing_data = true;
+            element.source_index = index;
+            stream.push_back(std::move(element));
+            return;
+        }
     }
-
-    stream.push_back(element);
+    if (!Room(size)) return;
+    element.extra_data.assign(data, data + size);
+    data_bytes += size;
+    candidates.push_back(stream.size());
+    stream.push_back(std::move(element));
 }
 
 void Recorder::RegisterWritten(u32 physical_address, u32 value) {
+    if (!Room()) return;
     StreamElement element = {{RegisterWrite}};
     element.data.register_write.physical_address = physical_address;
     element.data.register_write.value = value;
-
-    stream.push_back(element);
+    stream.push_back(std::move(element));
 }
 
 } // namespace CiTrace

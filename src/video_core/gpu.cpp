@@ -6,6 +6,7 @@
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
 #include "core/core.h"
+#include "core/frontend/debug_channel.h"
 #include "core/core_timing.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/hle/service/plgldr/plgldr.h"
@@ -485,9 +486,11 @@ void GPU::SubmitCmdList(u32 index) {
         return;
     }
 
+    if (DebugChannel::gpu_action) DebugChannel::gpu_action(1,index);
     impl->pica.ProcessCmdList(addr, size,
                               !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
     config.trigger[index] = 0;
+    if (DebugChannel::gpu_action) DebugChannel::gpu_action(5,index);
 }
 
 void GPU::MemoryFill(u32 index, u32 intr_index) {
@@ -497,6 +500,7 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
         return;
     }
 
+    if (DebugChannel::gpu_action) DebugChannel::gpu_action(2,index);
     // Perform memory fill.
     if (!impl->rasterizer->AccelerateFill(config)) {
         impl->sw_blitter->MemoryFill(config);
@@ -521,6 +525,7 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
     // This was confirmed to happen on hardware even if "address_start" is zero.
     config.trigger.Assign(0);
     config.finished.Assign(1);
+    if (DebugChannel::gpu_action) DebugChannel::gpu_action(6,index);
 }
 
 void GPU::MemoryTransfer() {
@@ -530,6 +535,7 @@ void GPU::MemoryTransfer() {
         return;
     }
 
+    if (DebugChannel::gpu_action) DebugChannel::gpu_action(3,0);
     MICROPROFILE_SCOPE(GPU_DisplayTransfer);
 
     // Notify debugger about the display transfer.
@@ -561,6 +567,7 @@ void GPU::MemoryTransfer() {
     // Complete transfer.
     config.trigger.Assign(0);
     impl->signal_interrupt(Service::GSP::InterruptId::PPF, delay);
+    if (DebugChannel::gpu_action) DebugChannel::gpu_action(7,0);
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
@@ -568,8 +575,10 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
 
+    if (DebugChannel::gpu_action) DebugChannel::gpu_action(0,0);
     // Present renderered frame.
     impl->renderer->SwapBuffers();
+    if (DebugChannel::gpu_action) DebugChannel::gpu_action(8,0);
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);

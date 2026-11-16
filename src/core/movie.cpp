@@ -194,7 +194,7 @@ void Movie::serialize(Archive& ar, const unsigned int file_version) {
             if (play_mode == PlayMode::Recording) {
                 SaveMovie();
             }
-            if (recorded_input_.size() >= recorded_input.size()) {
+            if (recorded_input_.size() > recorded_input.size() || current_byte > recorded_input_.size()) {
                 throw std::runtime_error("Future event savestate not allowed in R/O mode");
             }
             // Ensure that the current movie and savestate movie are in the same timeline

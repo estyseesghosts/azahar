@@ -6,6 +6,7 @@
 #include <map>
 #include <set>
 #include <boost/regex.hpp>
+#include <cryptopp/sha.h>
 #include "common/hash.h"
 #include "common/logging/backend.h"
 #include "common/logging/log_entry.h"
@@ -34,6 +35,7 @@
 #include "core/hle/service/cfg/cfg_defaults.h"
 #include "core/frontend/debug_channel.h"
 #include "ctr_worker/debug_gpu.h"
+#include "ctr_worker/debug_citrace.h"
 
 namespace CtrWorker {
 inline void DefaultProfile() {
@@ -64,6 +66,7 @@ public:
                 {"file",entry.filename ? entry.filename : ""},{"line",entry.line_num},
                 {"message",entry.message.substr(0,8192)},{"time_domain","host_monotonic"}});
         });
+        citrace = std::make_unique<GpuTrace>(system,root);
         gpu = std::make_unique<GpuTools>(system,root,
             [this](const char* kind,Json data){Record(kind,std::move(data));},
             [this](const char* reason,Json data){Stop(reason,std::move(data));});
@@ -185,6 +188,7 @@ public:
     void Detach() {
         Common::Log::SetObserver({});
         gpu.reset();
+        citrace.reset();
         DebugChannel::before_instruction = {};
         DebugChannel::memory_access = {};
         DebugChannel::guest_log = {};
@@ -204,6 +208,7 @@ public:
         }
         trace_svc = false;
         if (gpu) gpu->Clear();
+        if (citrace) citrace->Clear();
         if (system.IsPoweredOn()) {
             ArmWatches(false);
         }
@@ -306,7 +311,21 @@ public:
                 {"history_gap",!events.empty() && after+1<events.front().at("sequence").get<u64>()}};
     }
     bool IsStopped() const { return stopped; }
+    bool IsGpuReplayView() const { return citrace && citrace->IsReplayView(); }
     Json StopReason() const { return stop_reason; }
+    void SetContentIdentity(const std::string& path) {
+        CryptoPP::SHA256 hash;std::array<u8,65536> block{};
+        std::ifstream file(path,std::ios::binary);if(!file)throw std::invalid_argument("cannot read content identity");
+        while(file) {file.read(reinterpret_cast<char*>(block.data()),block.size());hash.Update(block.data(),file.gcount());}
+        if(!file.eof())throw std::invalid_argument("content identity read failed");
+        std::array<u8,CryptoPP::SHA256::DIGESTSIZE> digest{};hash.Final(digest.data());
+        const auto identity=Hex(digest);
+        if(movie_plan=="play") {
+            Json meta;std::ifstream(root/"movies"/(movie_name+".json"))>>meta;
+            if(meta.value("rom_sha256","")!=identity)throw std::invalid_argument("movie ROM content mismatch");
+        }
+        rom_sha256=identity;
+    }
     void MovieBeforeLoad() {
         system.Movie().Shutdown();
         if(movie_plan=="record")system.Movie().PrepareForRecording();
@@ -315,7 +334,7 @@ public:
     void MovieAfterLoad() {
         if(movie_plan=="record") {
             system.Movie().StartRecording((root/"movies"/(movie_name+".ctm")).string(),"LOTUS");
-            std::ofstream(root/"movies"/(movie_name+".json"))<<Json{{"source",CTR_SOURCE_SHA},{"settings",SettingsSnapshot()}}.dump();
+            std::ofstream(root/"movies"/(movie_name+".json"))<<Json{{"source",CTR_SOURCE_SHA},{"settings",SettingsSnapshot()},{"rom_sha256",rom_sha256}}.dump();
         }
         if(movie_plan=="play")system.Movie().StartPlayback((root/"movies"/(movie_name+".ctm")).string());
         movie_plan.clear();
@@ -473,18 +492,21 @@ public:
         auto result = DispatchInner(p, state);
         result["paused"] = state != "running";
         result["safe_point"] = true;
-        result["rasterizer_cache_flush"] = p.value("operation", "") == "read_memory" ||
+        result["rasterizer_cache_flush"] = result.value("rasterizer_cache_flush",false) || p.value("operation", "") == "citrace_start" || p.value("operation", "") == "read_memory" ||
             p.value("operation", "") == "write_memory" || p.value("operation", "") == "save_state";
         result["guest_ticks"] = system.IsPoweredOn() ? system.CoreTiming().GetGlobalTicks() : 0;
         result["renderer"] = static_cast<int>(Settings::values.graphics_api.GetValue());
         result["source"] = CTR_SOURCE_SHA;
         result["backend_name"] = CTR_BACKEND_NAME;
+        result["gpu_replay_view"] = IsGpuReplayView();
         return result;
     }
     Json DispatchInner(const Json& p, const std::string& state) {
         Poll();
         EnsureSettings();
         const auto op = p.at("operation").get<std::string>();
+        if(IsGpuReplayView() && (op=="step"||op=="step_over"||op=="step_out"||op=="run_to"||op=="run_until"||op=="citrace_start"||op=="save_state"))
+            throw std::invalid_argument("GPU replay view: load a checkpoint or reset before CPU execution/checkpointing");
         if(op=="content_transform") {
             const auto path=(root/"media/content.rom").string();const auto info=Loader::GetLoaderFileInfo(path);
             const bool compress=p.at("compress");
@@ -749,6 +771,22 @@ public:
 #ifndef CTR_EXPERIMENTAL
             throw std::runtime_error("operation requires CITnLO experimental backend");
 #else
+            if(op=="citrace_start") {
+                if(!paused)throw std::invalid_argument("CiTrace start requires pause");
+                auto save=p;save["operation"]="save_state";save["name"]="lotus-citrace";
+                Dispatch(save,state);return citrace->Start();
+            }
+            if(op=="citrace_stop")return citrace->Stop();
+            if(op=="citrace_status")return citrace->Status();
+            if(op=="citrace_replay") {
+                if(!paused)throw std::invalid_argument("CiTrace replay requires pause");
+                const auto trace=citrace->Read(); // Validate all input before mutating guest state.
+                if(citrace->Status().value("recording",false))throw std::invalid_argument("stop recording before replay");
+                auto load=p;load["operation"]="load_state";load["name"]="lotus-citrace";
+                const auto base=Dispatch(load,state);const auto replay=citrace->Replay(trace);
+                auto result=replay;result["worker_frame"]=base.at("worker_frame").get<u64>()+replay.at("frames").get<u64>();
+                result["worker_input"]=base.at("worker_input");return result;
+            }
             if (op == "gpu_configure" || op == "gpu_draws" || op == "gpu_draw" ||
                 op == "shader_trace" || op == "surface") return gpu->Dispatch(p);
             if (op == "hio_forward") {
@@ -1080,7 +1118,7 @@ public:
                         file.close();
                         std::ofstream meta(metadata.string()+".tmp");
                         meta.exceptions(std::ios::failbit | std::ios::badbit);
-                        meta << Json{{"archive_version",2},{"source", CTR_SOURCE_SHA}, {"settings", SettingsSnapshot()}, {"worker_frame", p.at("worker_frame")},
+                        meta << Json{{"rom_sha256",rom_sha256},{"archive_version",2},{"source", CTR_SOURCE_SHA}, {"settings", SettingsSnapshot()}, {"worker_frame", p.at("worker_frame")},
                                      {"worker_input",p.value("worker_input",Json::object())},
                                      {"content_xxh3_64",Common::ComputeHash64(bytes.data(),bytes.size())}}.dump();
                         meta.close();
@@ -1089,7 +1127,7 @@ public:
                     } else {
                         Json meta;
                         std::ifstream(metadata) >> meta;
-                        if (meta.value("archive_version",0)!=2 || meta.at("source") != CTR_SOURCE_SHA || meta.at("settings") != SettingsSnapshot())
+                        if (meta.value("rom_sha256","")!=rom_sha256 || meta.value("archive_version",0)!=2 || meta.at("source") != CTR_SOURCE_SHA || meta.at("settings") != SettingsSnapshot())
                             throw std::invalid_argument("checkpoint pin or settings mismatch");
                         const auto size = std::filesystem::file_size(path);
                         if (size > (256u << 20)) throw std::invalid_argument("checkpoint exceeds budget");
@@ -1186,6 +1224,8 @@ private:
     std::vector<Candidate> scan;
     u32 scan_width = 0;
     std::unique_ptr<GpuTools> gpu;
+    std::unique_ptr<GpuTrace> citrace;
+    std::string rom_sha256;
     IPCDebugger::CallbackHandle ipc_callback;
     std::mutex pending_mutex;
     std::deque<std::pair<std::string,Json>> pending_events;

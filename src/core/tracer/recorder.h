@@ -51,6 +51,10 @@ public:
      * @note Use this whenever a GPU-related MMIO register has been written to.
      */
     void RegisterWritten(u32 physical_address, u32 value);
+    bool Truncated() const { return dropped != 0; }
+    u64 Dropped() const { return dropped; }
+    size_t Elements() const { return stream.size(); }
+    size_t DataBytes() const { return data_bytes; }
 
 private:
     // Initial state of recording start
@@ -71,6 +75,7 @@ private:
 
         /// If true, refer to data already written to the output file instead of extra_data
         bool uses_existing_data;
+        size_t source_index = 0;
     };
 
     std::vector<StreamElement> stream;
@@ -79,7 +84,16 @@ private:
      * Internal cache which maps hashes of memory contents to file offsets at which those memory
      * contents are stored.
      */
-    std::unordered_map<boost::crc_32_type::value_type /*hash*/, u32 /*file_offset*/> memory_regions;
+    std::unordered_map<boost::crc_32_type::value_type, std::vector<size_t>> memory_regions;
+    static constexpr size_t element_limit = 262144, data_limit = 48u << 20;
+    size_t data_bytes = 0;
+    u64 dropped = 0;
+    bool Room(size_t bytes = 0) {
+        if (dropped || stream.size() >= element_limit || bytes > data_limit - data_bytes) {
+            ++dropped; return false;
+        }
+        return true;
+    }
 };
 
 } // namespace CiTrace

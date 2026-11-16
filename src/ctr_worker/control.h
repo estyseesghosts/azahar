@@ -193,7 +193,7 @@ private:
             }
             if (method == "debug") {
                 if (params.value("operation", "") == "input_state") {
-                    if(system.Movie().GetPlayMode()==Core::Movie::PlayMode::Playing)throw std::invalid_argument("movie playback owns input");
+                    if((system.Movie().GetPlayMode()==Core::Movie::PlayMode::Playing || system.Movie().GetPlayMode()==Core::Movie::PlayMode::MovieFinished))throw std::invalid_argument("movie playback owns input");
                     if (!system.IsPoweredOn()) throw std::invalid_argument("input requires loaded content");
                     const auto requested = params.at("owner").get<std::string>();
                     if ((requested!="live" && requested!="scenario") || (owner=="scenario" && requested!=owner)) {
@@ -207,7 +207,7 @@ private:
                 debug_params["worker_frame"] = window.frames;
                 debug_params["worker_input"] = {{"owner",owner},{"state",SnapshotInput(input)}};
                 auto result = debug.Dispatch(debug_params, state);
-                if (params.value("operation", "") == "load_state" ||
+                if (params.value("operation", "") == "load_state" || params.value("operation", "") == "citrace_replay" ||
                     params.value("operation", "") == "reverse_step" || params.value("operation", "") == "reverse_continue") {
                     ++epoch;
                     capture_sequence = 0;
@@ -253,6 +253,7 @@ private:
                     Reply(request, "invalid_argument");
                     return;
                 }
+                debug.SetContentIdentity(path);
                 debug.Clear();
                 if (system.IsPoweredOn())
                     system.Shutdown();
@@ -283,6 +284,7 @@ private:
                 return;
             }
             if (method == "run" || method == "run_until") {
+                if(debug.IsGpuReplayView())throw std::invalid_argument("GPU replay view: load a checkpoint or reset before CPU execution");
                 if (state != "paused" || pending_run) {
                     Reply(request, "not_ready");
                     return;
@@ -317,7 +319,7 @@ private:
                       {{"frames", Capture(system, root, epoch, ++capture_sequence, params.is_object()?params.value("scale",1u):1u)},
                        {"frame", window.frames}});
             } else if (method == "input") {
-                if(system.Movie().GetPlayMode()==Core::Movie::PlayMode::Playing)throw std::invalid_argument("movie playback owns input");
+                if((system.Movie().GetPlayMode()==Core::Movie::PlayMode::Playing || system.Movie().GetPlayMode()==Core::Movie::PlayMode::MovieFinished))throw std::invalid_argument("movie playback owns input");
                 const auto requested_owner = params.at("owner").get<std::string>();
                 if (requested_owner != "live" && requested_owner != "scenario") {
                     Reply(request, "invalid_argument");
@@ -375,8 +377,8 @@ private:
                 Reply(request, "unsupported");
         } catch (const std::out_of_range&) {
             Reply(request, "invalid_argument");
-        } catch (const std::invalid_argument&) {
-            Reply(request, "invalid_argument");
+        } catch (const std::invalid_argument& error) {
+            Reply(request, "invalid_argument", {{"reason",error.what()}});
         } catch (const Json::exception&) {
             Reply(request, "invalid_argument");
         } catch (const std::filesystem::filesystem_error&) {
