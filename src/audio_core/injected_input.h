@@ -46,14 +46,22 @@ public:
     void StartSampling(const InputParameters& p) override { parameters=p;phase=0;sampling=true; }
     void StopSampling() override { sampling=false; }
     bool IsSampling() override { return sampling; }
-    void AdjustSampleRate(u32 rate) override { parameters.sample_rate=rate;phase=0; }
+    void AdjustSampleRate(u32 rate) override {
+        const auto old=std::max(parameters.sample_rate,1u);
+        phase=(phase/old)*rate+(phase%old)*rate/old;parameters.sample_rate=rate;
+    }
+    u64 GetReplayCursor() const override {return phase;}
+    void SetReplayCursor(u64 cursor) override {
+        if(cursor>u64(samples.size())*std::max(parameters.sample_rate,1u))throw std::invalid_argument("injected microphone cursor exceeds asset");
+        phase=cursor;
+    }
     Samples Read() override {
         if(!sampling)return {};
         Samples output;output.reserve(32);
         for(unsigned i=0;i<16;++i) {
             const auto index=phase/std::max(parameters.sample_rate,1u);
             const s16 value=index<samples.size()?samples[index]:0;
-            phase+=source_rate;
+            phase=std::min(phase+source_rate,u64(samples.size())*std::max(parameters.sample_rate,1u));
             const u16 encoded=parameters.sign==Signedness::Unsigned?static_cast<u16>(s32(value)+32768):static_cast<u16>(value);
             if(parameters.sample_size==8)output.push_back(encoded>>8);
             else {output.push_back(encoded&255);output.push_back(encoded>>8);}

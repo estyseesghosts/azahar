@@ -18,9 +18,7 @@ class Control {
 public:
     explicit Control(std::string root) : root(std::filesystem::absolute(root)) {}
     int Run() {
-#ifdef _WIN32
-        _setmode(_fileno(stdout), _O_BINARY);
-#endif
+        ReserveControlOutput();
         Initialize(system, root.string(), unsupported);
         RegisterInput(input);
         Settings::values.output_type = AudioCore::SinkType::Worker;
@@ -193,6 +191,13 @@ private:
                     return;
                 }
                 const auto path = method == "load" ? params.at("path").get<std::string>() : content;
+                if(Settings::values.input_type.GetValue()==AudioCore::InputType::Injected) {
+                    const auto mic_path=root/"media/mic.wav";
+                    if(!std::filesystem::is_regular_file(mic_path)) {
+                        Reply(request,"not_ready",{{"error","missing_mic_asset"},{"required_asset","mic_wav"}});return;
+                    }
+                    AudioCore::InjectedInput::Load(mic_path);
+                }
                 if(Settings::values.audio_emulation.GetValue()!=Settings::AudioEmulation::HLE &&
                     !std::filesystem::is_regular_file(root/"sdmc/3ds/dspfirm.cdc")) {
                     Reply(request,"not_ready",{{"error","missing_dsp_firmware"},
