@@ -262,6 +262,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
 
     const u8* head = memory.GetPhysicalPointer(list);
     cmd_list.Reset(list, head, size);
+    ++command_lists;
 
     bool stop_requested = false;
     bool skip_fast_path = false;
@@ -1008,6 +1009,7 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    ++draw_calls;
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
@@ -1047,6 +1049,7 @@ void PicaCore::DrawImmediate() {
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
+    ++draw_calls;
 
     // Track vertex in the debug recorder.
     if (debug_context) {

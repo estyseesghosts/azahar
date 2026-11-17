@@ -126,6 +126,10 @@ public:
 
     /// Commands written by the batched fast path since construction (debug telemetry).
     u64 fast_path_commands = 0;
+    /// Command lists processed and draws issued (array, indexed or immediate) since
+    /// construction, on either command path (debug telemetry, never serialized).
+    u64 command_lists = 0;
+    u64 draw_calls = 0;
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
