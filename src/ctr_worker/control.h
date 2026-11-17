@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -232,6 +233,28 @@ private:
                 state = "paused";
                 ++epoch;
                 Reply(request, "ok", Snapshot());
+                return;
+            }
+            if (method == "flush_storage") {
+                // Make guest storage on disk match what the guest has written, so the host can
+                // copy a card at one guest timeline point. FS service calls may run on host
+                // threads (HLERequestContext::RunAsync, kernel/hle_ipc.h) while the guest waits;
+                // they count as pending until the guest thread wakes, so a pending operation is
+                // refused rather than raced. Guest files are FileUtil::IOFile over std::FILE
+                // (common/file_util.h, CORE_FILE). FSFILE_Write reaches the OS at once, because
+                // Service::FS::File::Write calls GetSize, which seeks (common/file_util.cpp,
+                // GetSize(FILE*)); other IOFile writers have no such seek, hence the flush.
+                if (state == "running") {
+                    Reply(request, "not_ready", {{"reason", "running"}});
+                    return;
+                }
+                if (system.IsPoweredOn() && system.Kernel().AreAsyncOperationsPending()) {
+                    Reply(request, "not_ready", {{"reason", "async_fs_pending"}});
+                    return;
+                }
+                // C11 7.21.5.2: a null stream flushes every output stream of the process.
+                const bool flushed = std::fflush(nullptr) == 0;
+                Reply(request, flushed ? "ok" : "unsupported", {{"flushed", flushed}});
                 return;
             }
             if (!system.IsPoweredOn()) {
