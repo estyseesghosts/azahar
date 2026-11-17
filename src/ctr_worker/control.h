@@ -305,7 +305,7 @@ private:
                     Reply(request, "not_ready");
                     return;
                 }
-                Reply(request, "ok", preview.Write(system, epoch, window.frames));
+                Reply(request, "ok", preview.Write(system, epoch, window.frames, state == "running"));
             } else if (method == "input") {
                 const auto requested_owner = params.at("owner").get<std::string>();
                 if (requested_owner != "live" && requested_owner != "scenario") {

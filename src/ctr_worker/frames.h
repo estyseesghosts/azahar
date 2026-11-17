@@ -34,16 +34,24 @@ inline void FrameHeader(u8* out, u64 epoch, u64 sequence, u32 width, u32 height)
     put(28, height, 4);
 }
 
-// Row-major BGRA of one screen at `scale`, into `pixels` (width*height*4 bytes).
-// Software: copied from the renderer's own buffer. Vulkan: `preview` selects the
-// double-buffered readback (may return an earlier request's frame, see
-// RendererBase::PreviewOffscreen); otherwise a synchronous readback. Returns frame_id
-// of the pixels.
-inline u64 ScreenPixels(Core::System& system, const ScreenSpec& screen, u32 scale, u8* pixels,
-                        bool preview, u64 frame_id) {
+inline Layout::FramebufferLayout ScreenLayout(const ScreenSpec& screen, u32 scale) {
+    auto layout = Layout::SingleFrameLayout(screen.native_width * scale, 240 * scale,
+                                            screen.id == VideoCore::ScreenId::Bottom, false);
+    layout.render_3d_mode = Settings::StereoRenderOption::Off;
+    return layout;
+}
+
+inline bool SoftwareRenderer() {
+    return Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::Software;
+}
+
+// Row-major BGRA of the current frame of one screen at `scale`, into `pixels`
+// (width*height*4 bytes). Software: copied from the renderer's own buffer. Vulkan: a
+// synchronous readback.
+inline void ScreenPixels(Core::System& system, const ScreenSpec& screen, u32 scale, u8* pixels) {
     auto& renderer = system.GPU().Renderer();
     const auto width = screen.native_width * scale, height = 240 * scale;
-    if (Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::Software) {
+    if (SoftwareRenderer()) {
         const auto& source = static_cast<SwRenderer::RendererSoftware&>(renderer).Screen(screen.id);
         if (source.width != 240 || source.height != screen.native_width ||
             source.pixels.size() != screen.native_width * 240 * 4)
@@ -57,16 +65,10 @@ inline u64 ScreenPixels(Core::System& system, const ScreenSpec& screen, u32 scal
                 pixels[output + 2] = source.pixels[input];
                 pixels[output + 3] = source.pixels[input + 3];
             }
-        return frame_id;
+        return;
     }
 #ifdef ENABLE_VULKAN
-    auto layout = Layout::SingleFrameLayout(width, height, screen.id == VideoCore::ScreenId::Bottom, false);
-    layout.render_3d_mode = Settings::StereoRenderOption::Off;
-    if (preview)
-        return renderer.PreviewOffscreen(pixels, layout, screen.id == VideoCore::ScreenId::Bottom,
-                                         frame_id);
-    renderer.CaptureOffscreen(pixels, layout);
-    return frame_id;
+    renderer.CaptureOffscreen(pixels, ScreenLayout(screen, scale));
 #else
     throw std::runtime_error("offscreen capture unsupported by renderer");
 #endif
@@ -82,7 +84,7 @@ inline nlohmann::json Capture(Core::System& system, const std::filesystem::path&
     for (const auto& screen : SCREENS) {
         const auto width=screen.native_width*scale,height=240*scale;
         std::vector<u8> data(FRAME_HEADER + width * height * 4);
-        ScreenPixels(system, screen, scale, data.data() + FRAME_HEADER, false, 0);
+        ScreenPixels(system, screen, scale, data.data() + FRAME_HEADER);
         FrameHeader(data.data(), epoch, sequence, width, height);
         const auto relative =
             "frames/" + std::string{screen.name} + "-" + std::to_string(sequence % 3) + ".bgra";
@@ -110,6 +112,10 @@ inline nlohmann::json Capture(Core::System& system, const std::filesystem::path&
 // bytes as the capture files. The worker writes a slot only while answering `preview`, and the
 // host copies it before its next request to this worker (requests are serialized), so a slot
 // is never read while written; the header's epoch and sequence reject stale slots.
+// While running, Vulkan previews never wait for the GPU (RendererBase::PreviewScreens): a
+// request publishes the newest completed pair of this epoch, or, when none is newer than the
+// last one published, answers with that slot again (`new_frame: false`), or with no frames when
+// this epoch has none yet. A paused request may wait and always shows the current frame.
 class PreviewRing {
 public:
     static constexpr u32 SLOTS = 3;
@@ -138,18 +144,44 @@ public:
 #endif
     }
 
-    nlohmann::json Write(Core::System& system, u64 epoch, u64 frames) {
+    nlohmann::json Write(Core::System& system, u64 epoch, u64 frames, bool running) {
         Open();
-        const u64 sequence = ++this->sequence;
+        ++requests;
+        const u64 sequence = this->sequence + 1;
         const u64 slot = sequence % SLOTS;
         u8* base = view + slot * SLOT;
         const u64 id = (epoch << FRAME_BITS) | (frames & ((u64{1} << FRAME_BITS) - 1));
         u64 shown = id;
+        if (SoftwareRenderer()) {
+            std::size_t offset = 0;
+            for (const auto& screen : SCREENS) {
+                ScreenPixels(system, screen, 1, base + offset + FRAME_HEADER);
+                offset += FRAME_HEADER + screen.native_width * 240 * 4;
+            }
+        } else {
+            shown = system.GPU().Renderer().PreviewScreens(
+                {base + FRAME_HEADER, base + TOP + FRAME_HEADER},
+                {ScreenLayout(SCREENS[0], 1), ScreenLayout(SCREENS[1], 1)}, id, epoch << FRAME_BITS,
+                !running);
+        }
+        if (!shown) {
+            ++reused;
+            nlohmann::json reply = last.is_object() && last.value("epoch", u64{0}) == epoch
+                                       ? last
+                                       : nlohmann::json{{"name", name}, {"bytes", BYTES},
+                                                        {"frames", nlohmann::json::array()}, {"frame", 0}};
+            reply.erase("epoch");
+            reply["new_frame"] = false;
+            reply["current_frame"] = frames;
+            reply["current_epoch"] = epoch;
+            reply["stats"] = Stats(system);
+            return reply;
+        }
+        this->sequence = sequence;
         nlohmann::json leases = nlohmann::json::array();
         std::size_t offset = 0;
         for (const auto& screen : SCREENS) {
             const u32 width = screen.native_width, height = 240;
-            shown = ScreenPixels(system, screen, 1, base + offset + FRAME_HEADER, true, id);
             const u64 shown_epoch = shown >> FRAME_BITS;
             FrameHeader(base + offset, shown_epoch, sequence, width, height);
             leases.push_back({{"screen", screen.name},
@@ -165,16 +197,30 @@ public:
                               {"bytes", width * height * 4}});
             offset += FRAME_HEADER + width * height * 4;
         }
-        // Both screens come from the same request, so they share one frame id.
-        return {{"name", name},
-                {"bytes", BYTES},
-                {"frames", leases},
-                {"frame", shown & ((u64{1} << FRAME_BITS) - 1)},
-                {"current_frame", frames},
-                {"current_epoch", epoch}};
+        // Both screens come from one completed pair, so they share one frame id.
+        nlohmann::json reply = {{"name", name},
+                                {"bytes", BYTES},
+                                {"frames", leases},
+                                {"frame", shown & ((u64{1} << FRAME_BITS) - 1)}};
+        last = reply;
+        last["epoch"] = shown >> FRAME_BITS;
+        reply["new_frame"] = true;
+        reply["current_frame"] = frames;
+        reply["current_epoch"] = epoch;
+        reply["stats"] = Stats(system);
+        return reply;
     }
 
 private:
+    nlohmann::json Stats(Core::System& system) const {
+        const auto gpu = system.GPU().Renderer().PreviewStatistics();
+        return {{"requests", requests},         {"reused", reused},
+                {"readbacks", gpu.readbacks},   {"skipped_busy", gpu.skipped_busy},
+                {"gpu_waits", gpu.gpu_waits},   {"gpu_wait_ns", gpu.gpu_wait_ns},
+                {"copied_bytes", gpu.copied_bytes}};
+    }
+    u64 requests = 0, reused = 0;
+    nlohmann::json last; // reply of the last published slot, with its epoch
     void Open() {
         if (view) return;
 #ifdef _WIN32

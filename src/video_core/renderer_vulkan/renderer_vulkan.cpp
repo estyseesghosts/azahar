@@ -2,6 +2,7 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <chrono>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/memory_detect.h"
@@ -1204,47 +1205,168 @@ void RendererVulkan::CaptureOffscreen(void* pixels, const Layout::FramebufferLay
     if (!complete) throw std::runtime_error("offscreen readback failed");
 }
 
-u64 RendererVulkan::PreviewOffscreen(void* pixels, const Layout::FramebufferLayout& layout,
-                                     u32 stream, u64 frame_id) {
-    if (stream >= preview_slots.size()) {
-        throw std::invalid_argument("preview stream");
+// Live preview without GPU waits while running (lotus#25). Top and bottom copies of one
+// request are recorded before a single Flush, so they share one tick and complete together;
+// a pair is published only when both of its slots have completed.
+void RendererVulkan::RetirePreviewSlots() {
+    scheduler.GetMasterSemaphore()->Refresh(); // timeline: reads the counter, never blocks
+    for (auto& ring : preview_slots) {
+        for (auto& slot : ring) {
+            if (slot.pending && scheduler.IsFree(slot.tick)) {
+                slot.pending = false;
+                slot.ready = true;
+            }
+        }
     }
-    auto& ring = preview_slots[stream];
-    PreviewSlot& slot = ring[preview_next[stream]];
-    PreviewSlot& previous = ring[preview_next[stream] ^ 1];
-    const u32 width = layout.width;
-    const u32 height = layout.height;
-    // This slot was submitted two requests ago; its copy has normally finished.
-    if (slot.pending) {
-        scheduler.Wait(slot.tick);
-        slot.pending = false;
-    }
-    ResizePreviewSlot(slot, width, height);
-    PrepareRendertarget();
-    DrawScreens(&slot.frame, layout, false);
-    RecordFrameCopy(slot.frame, slot.buffer, width, height);
-    // Same tick bookkeeping as Scheduler::Finish, without waiting here.
-    slot.tick = scheduler.CurrentTick();
-    scheduler.Flush();
-    slot.frame_id = frame_id;
-    slot.pending = true;
-    preview_next[stream] ^= 1;
+}
 
-    PreviewSlot* source = &slot;
-    if (previous.pending && previous.frame_id != frame_id && previous.size == slot.size) {
-        source = &previous;
+RendererVulkan::PreviewSlot* RendererVulkan::FreePreviewSlot(u32 stream, bool may_wait) {
+    auto& ring = preview_slots[stream];
+    PreviewSlot* oldest = nullptr;
+    for (auto& slot : ring) {
+        if (!slot.pending && !slot.ready) {
+            return &slot;
+        }
     }
-    scheduler.Wait(source->tick);
+    // A completed copy that a newer completed copy supersedes may be overwritten.
+    PreviewSlot* newest_ready = nullptr;
+    for (auto& slot : ring) {
+        if (slot.ready && (!newest_ready || slot.frame_id > newest_ready->frame_id)) {
+            newest_ready = &slot;
+        }
+    }
+    for (auto& slot : ring) {
+        if (slot.ready && &slot != newest_ready) {
+            return &slot;
+        }
+        if (slot.pending && (!oldest || slot.tick < oldest->tick)) {
+            oldest = &slot;
+        }
+    }
+    if (!may_wait || !oldest) {
+        return nullptr;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    scheduler.Wait(oldest->tick);
+    ++preview_stats.gpu_waits;
+    preview_stats.gpu_wait_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count());
+    oldest->pending = false;
+    oldest->ready = false;
+    return oldest;
+}
+
+RendererVulkan::PreviewSlot* RendererVulkan::ReadyPreviewSlot(u32 stream, u64 frame_id) {
+    for (auto& slot : preview_slots[stream]) {
+        if (slot.ready && slot.frame_id == frame_id) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+void RendererVulkan::CopyPreviewSlot(const PreviewSlot& slot, void* pixels) {
     // AUTO_PREFER_HOST may pick non-coherent memory; make the GPU writes visible.
-    vmaInvalidateAllocation(instance.GetAllocator(), source->allocation, 0, VK_WHOLE_SIZE);
-    std::memcpy(pixels, source->mapped, source->size);
+    vmaInvalidateAllocation(instance.GetAllocator(), slot.allocation, 0, VK_WHOLE_SIZE);
+    std::memcpy(pixels, slot.mapped, slot.size);
     if (main_present_window.GetSurfaceFormat() == vk::Format::eR8G8B8A8Unorm) {
         u8* bytes = static_cast<u8*>(pixels);
-        for (u64 i = 0; i < source->size / 4; i++) {
+        for (u64 i = 0; i < slot.size / 4; i++) {
             std::swap(bytes[i * 4 + 0], bytes[i * 4 + 2]);
         }
     }
-    return source->frame_id;
+    preview_stats.copied_bytes += slot.size;
+}
+
+u64 RendererVulkan::PreviewScreens(const std::array<void*, 2>& pixels,
+                                   const std::array<Layout::FramebufferLayout, 2>& layouts,
+                                   u64 frame_id, u64 oldest, bool may_wait) {
+    RetirePreviewSlots();
+    // Submit the current frame unless every slot of a screen is still in flight. Both screens
+    // or neither, so a submitted pair always completes as a pair.
+    // A frame already submitted (repeated requests while paused) is not copied again.
+    PreviewSlot* submitted = nullptr;
+    for (auto& slot : preview_slots[0]) {
+        if ((slot.pending || slot.ready) && slot.frame_id == frame_id) {
+            submitted = &slot;
+        }
+    }
+    std::array<PreviewSlot*, 2> targets{};
+    if (!submitted) {
+        targets = {FreePreviewSlot(0, may_wait), FreePreviewSlot(1, may_wait)};
+    }
+    if (submitted) {
+        if (may_wait && submitted->pending) {
+            const auto started = std::chrono::steady_clock::now();
+            scheduler.Wait(submitted->tick);
+            ++preview_stats.gpu_waits;
+            preview_stats.gpu_wait_ns += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+            RetirePreviewSlots();
+        }
+    } else if (targets[0] && targets[1]) {
+        for (u32 stream = 0; stream < 2; ++stream) {
+            PreviewSlot& slot = *targets[stream];
+            ResizePreviewSlot(slot, layouts[stream].width, layouts[stream].height);
+            PrepareRendertarget();
+            DrawScreens(&slot.frame, layouts[stream], false);
+            RecordFrameCopy(slot.frame, slot.buffer, layouts[stream].width, layouts[stream].height);
+        }
+        // Same tick bookkeeping as Scheduler::Finish, without waiting here.
+        const u64 tick = scheduler.CurrentTick();
+        scheduler.Flush();
+        for (auto* slot : targets) {
+            slot->tick = tick;
+            slot->frame_id = frame_id;
+            slot->pending = true;
+            slot->ready = false;
+        }
+        ++preview_stats.readbacks;
+        if (may_wait) {
+            const auto started = std::chrono::steady_clock::now();
+            scheduler.Wait(tick);
+            ++preview_stats.gpu_waits;
+            preview_stats.gpu_wait_ns += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+            RetirePreviewSlots();
+        }
+    } else {
+        ++preview_stats.skipped_busy;
+    }
+    // Newest completed pair not yet published, never one older than `oldest` (an earlier
+    // epoch). Nothing newer: the caller answers with the slot it published last.
+    u64 shown = 0;
+    for (const auto& slot : preview_slots[0]) {
+        if (slot.ready && slot.frame_id >= oldest && slot.frame_id > preview_published &&
+            slot.frame_id > shown &&
+            ReadyPreviewSlot(1, slot.frame_id)) {
+            shown = slot.frame_id;
+        }
+    }
+    if (!shown) {
+        ++preview_stats.stale;
+        return 0;
+    }
+    for (u32 stream = 0; stream < 2; ++stream) {
+        PreviewSlot* source = ReadyPreviewSlot(stream, shown);
+        if (source->size != u64{layouts[stream].width} * layouts[stream].height * 4) {
+            ++preview_stats.stale;
+            return 0; // copied at another size; the next submission matches
+        }
+        CopyPreviewSlot(*source, pixels[stream]);
+    }
+    // This and older completed pairs can no longer be published.
+    for (auto& ring : preview_slots) {
+        for (auto& slot : ring) {
+            if (slot.ready && slot.frame_id <= shown) {
+                slot.ready = false;
+            }
+        }
+    }
+    preview_published = shown;
+    return shown;
 }
 
 void RendererVulkan::ResizePreviewSlot(PreviewSlot& slot, u32 width, u32 height) {

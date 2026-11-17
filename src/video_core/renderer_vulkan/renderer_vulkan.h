@@ -83,11 +83,14 @@ public:
     void SwapBuffers() override;
     /// Explicit emulation-safe-point readback; never advances guest execution.
     void CaptureOffscreen(void* pixels, const Layout::FramebufferLayout& layout);
-    /// Double-buffered per stream: submits a copy of the current frame and returns the previous
-    /// request's copy when it shows an older frame, so only that older submission is waited on.
-    /// Returns the current frame (waiting for it) when nothing was presented since.
-    u64 PreviewOffscreen(void* pixels, const Layout::FramebufferLayout& layout, u32 stream,
-                         u64 frame_id) override;
+    /// Never waits for the GPU while running: completion is polled (Scheduler::IsFree after a
+    /// non-blocking MasterSemaphore::Refresh). See RendererBase::PreviewScreens.
+    u64 PreviewScreens(const std::array<void*, 2>& pixels,
+                       const std::array<Layout::FramebufferLayout, 2>& layouts, u64 frame_id,
+                       u64 oldest, bool may_wait) override;
+    PreviewStats PreviewStatistics() const override {
+        return preview_stats;
+    }
     void TryPresent(int timeout_ms, bool is_secondary) override {}
 
 private:
@@ -110,13 +113,21 @@ private:
         u64 size{};
         u64 tick{};
         u64 frame_id{};
-        bool pending{};
+        bool pending{}; ///< Copy submitted, completion not yet observed.
+        bool ready{};   ///< Copy completed and not yet superseded by a published pair.
     };
+    /// Three slots per screen: one being read back, one completed, one free to submit into.
+    static constexpr std::size_t PREVIEW_SLOTS = 3;
     void RecordFrameCopy(const Frame& frame, vk::Buffer buffer, u32 width, u32 height);
     void ResizePreviewSlot(PreviewSlot& slot, u32 width, u32 height);
     void DestroyPreviewSlot(PreviewSlot& slot);
-    std::array<std::array<PreviewSlot, 2>, 2> preview_slots{};
-    std::array<u32, 2> preview_next{};
+    void RetirePreviewSlots();
+    PreviewSlot* FreePreviewSlot(u32 stream, bool may_wait);
+    PreviewSlot* ReadyPreviewSlot(u32 stream, u64 frame_id);
+    void CopyPreviewSlot(const PreviewSlot& slot, void* pixels);
+    std::array<std::array<PreviewSlot, PREVIEW_SLOTS>, 2> preview_slots{};
+    PreviewStats preview_stats{};
+    u64 preview_published = 0; ///< Id of the last pair copied out; never copied again.
     bool TryRenderScreenshotWithHostMemory();
     void PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout);
     void RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
