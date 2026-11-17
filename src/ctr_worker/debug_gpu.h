@@ -42,6 +42,7 @@ public:
         DebugChannel::gpu_event=[this](u32 event,const void* data){Event(event,data);};
     }
     ~GpuTools(){Activate(false);DebugChannel::gpu_event={};}
+    std::function<bool()> wants_events;
     // Emulation-thread safe point only (worker dispatch runs between RunLoop calls).
     void Activate(bool on) {
         if(system.IsPoweredOn())system.GPU().SetDebugContext(on?context:nullptr);
@@ -232,6 +233,14 @@ public:
         }
         if(event==0)++command_sequence;
         if(event==2)FreezeDraw(pointer&&*static_cast<const bool*>(pointer));
+        if(event==4&&pointer&&!draws.empty()&&draws.back().snapshot) {
+            auto& inputs=draws.back().inputs;
+            if(inputs.size()<8)inputs.push_back(Input(pointer));
+            else ++vertices_lost;
+        }
+        // No event JSON unless a subscriber, the history or a draw predicate wants it, or the
+        // event stops (lotus#26). Counters and snapshots above do not depend on it.
+        if(!breaks.test(event)&&wants_events&&!wants_events())return;
         Json data={{"event",event},{"command",command_sequence},{"draw",draw_sequence}};
         if((event==0||event==1)&&pointer) {
             const auto id=*static_cast<const u32*>(pointer);
@@ -239,11 +248,6 @@ public:
             if(id<Pica::RegsInternal::NUM_REGS)data["value"]=system.GPU().PicaCore().regs.internal.reg_array[id];
         }
         if(event==6&&pointer){u32 header;std::memcpy(&header,pointer,4);data["gsp_header"]=header;}
-        if(event==4&&pointer&&!draws.empty()&&draws.back().snapshot) {
-            auto& inputs=draws.back().inputs;
-            if(inputs.size()<8)inputs.push_back(Input(pointer));
-            else ++vertices_lost;
-        }
         record("pica",data);
         if(breaks.test(event)) {halted=true;collect_stop_inputs=event==2;data["stop_boundary"]="next_CPU_safe_point";data["event_observed"]=true;stop("pica",data);}
     }

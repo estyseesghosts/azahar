@@ -22,6 +22,7 @@ public:
     explicit Control(std::string root) : root(std::filesystem::absolute(root)) {}
     int Run() {
         ReserveControlOutput();
+        writer.Start();
         Initialize(system, root.string(), unsupported);
         RegisterInput(input);
         RegisterCamera();
@@ -33,10 +34,11 @@ public:
         debug.get_input = [this] { return Json{{"owner", owner}, {"state", SnapshotInput(input)}}; };
         debug.get_frame = [this] { return window.frames; };
         debug.set_frame = [this](u64 frame) { window.frames = frame; };
-        debug.notification = [this](const Json& data) {
-            if (notifications)
-                Send({{"notification", true}, {"version_major", 1}, {"version_minor", 0},
-                      {"session", session}, {"epoch", epoch}, {"data", data}});
+        // Called only for subscribed categories (DebugTools::Record); stops are reliable.
+        debug.notification = [this](const Json& data, bool reliable) {
+            writer.Post({{"notification", true}, {"version_major", 1}, {"version_minor", 0},
+                         {"session", session}, {"epoch", epoch}, {"data", data}},
+                        reliable);
         };
         Settings::values.output_type = AudioCore::SinkType::Worker;
         Frontend::control_callback = [this] { Drain(true); };
@@ -59,7 +61,7 @@ public:
             system.NotifyPendingWork();
         }};
         try {
-            while (!stopping && !disconnected) {
+            while (!stopping && !disconnected && !writer.Failed()) {
                 debug.Poll();
                 Drain(false);
                 if (state == "running") {
@@ -102,6 +104,8 @@ public:
             std::cerr << "worker_control_error: " << error.what() << '\n';
             exit_code = 1;
         }
+        if (writer.Failed())
+            exit_code = 1;
         stopping = true;
         stdin_reader.Interrupt();
         reader.join();
@@ -110,6 +114,7 @@ public:
         if (system.IsPoweredOn())
             system.Shutdown();
         AudioCore::WorkerSink::CaptureStop();
+        writer.Close();
         Common::Log::Stop();
         return exit_code;
     }
@@ -118,15 +123,16 @@ private:
     Json Snapshot() {
         const auto audio = AudioCore::WorkerSink::Drain();
         return {{"debug_api", true}, {"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
-                {"stop", debug.StopReason()}, {"last_error", last_error},         {"input_owner", owner},
+                {"stop", debug.StopReason()}, {"events", debug.EventStatus()}, {"last_error", last_error},         {"input_owner", owner},
                 {"buttons", input.buttons},         {"touch_down", input.touch},
                 {"audio_samples", audio.samples},   {"audio_dropped", audio.dropped},
                 {"audio_focused", AudioCore::WorkerSink::focused},
                 {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered},
-                {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"}};
+                {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"},
+                {"transport", writer.Stats()}};
     }
     void Reply(const Json& request, const std::string& status, Json data = nullptr) {
-        Send({{"version_major", 1},
+        writer.Post({{"version_major", 1},
               {"version_minor", 0},
               {"request_id", request.at("request_id")},
               {"session", request.at("session")},
@@ -134,7 +140,8 @@ private:
               {"status", status},
               {"state", state},
               {"backend", "azahar_native_software"},
-              {"data", std::move(data)}});
+              {"data", std::move(data)}},
+             true);
     }
     void Drain(bool nested) {
         // Never destroy/reinitialize a core while inside its RunLoop/frame limiter.
@@ -205,7 +212,7 @@ private:
                 }
                 method="load";params={{"path",path}};
             }
-            if (method == "hello") notifications = params.is_object() && params.value("notifications", false);
+            if (method == "hello") debug.ConfigureEvents(params, true);
             if (method == "hello" || method == "status") {
                 Reply(request, "ok", Snapshot());
                 return;
@@ -461,7 +468,7 @@ private:
     std::string session, content, last_error, state = "idle", owner = "live";
     u64 epoch = 1, target = 0, capture_sequence = 0, last_request = 0;
     PreviewRing preview;
-    bool unsupported = false, notifications = false;
+    bool unsupported = false;
     int exit_code = 0;
     std::chrono::steady_clock::time_point deadline;
     std::optional<Json> pending_run;
@@ -469,5 +476,6 @@ private:
     std::deque<Json> queue;
     std::atomic_bool stopping = false, disconnected = false;
     StdinReader stdin_reader;
+    ControlWriter writer;
 };
 } // namespace CtrWorker

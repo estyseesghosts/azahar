@@ -63,6 +63,7 @@ public:
     void Attach() {
         system.Movie().SetRecordingBudget(32u<<20);
         Common::Log::SetObserver([this](const Common::Log::Entry& entry) {
+            if (!Wanted(NATIVE_LOG)) return;
             QueueEvent("native_log", {{"host_microseconds",entry.timestamp.count()},
                 {"severity",Common::Log::GetLevelName(entry.log_level)},
                 {"category",Common::Log::GetLogClassName(entry.log_class)},
@@ -73,6 +74,7 @@ public:
         gpu = std::make_unique<GpuTools>(system,root,
             [this](const char* kind,Json data){Record(kind,std::move(data));},
             [this](const char* reason,Json data){Stop(reason,std::move(data));});
+        gpu->wants_events=[this]{return Wanted(PICA);};
         DebugChannel::before_instruction = [this](auto& core, auto* thread) {
             if (stopped) return true;
             if (replaying && replay_instructions == replay_halt_instruction) { HaltReplay(); return true; }
@@ -94,7 +96,10 @@ public:
                 if (bp.process && (!process || *bp.process != process->process_id)) continue;
                 ++bp.hits;
                 if (bp.hits < bp.hit_after || !Matches(bp.condition, core)) continue;
-                if (!bp.log.empty()) { Record("logpoint", {{"breakpoint", id}, {"text", bp.log}, {"pc", core.GetPC()}}); continue; }
+                if (!bp.log.empty()) {
+                    if (Wanted(LOG)) Record("logpoint", {{"breakpoint", id}, {"text", bp.log}, {"pc", core.GetPC()}});
+                    continue;
+                }
                 if (Hit("breakpoint", {{"breakpoint", id}, {"address", bp.address}, {"core", core.GetID()},
                                    {"thread", thread->thread_id}, {"process", process ? process->process_id : 0}},
                         replay_instructions))
@@ -115,7 +120,7 @@ public:
                     ++bp.hits;
                     if (bp.hits < bp.hit_after || !Matches(bp.condition, system.GetRunningCore())) continue;
                     if (!bp.log.empty()) {
-                        Record("logpoint", {{"breakpoint", id}, {"text", bp.log}, {"address", address}, {"write", write}});
+                        if (Wanted(LOG)) Record("logpoint", {{"breakpoint", id}, {"text", bp.log}, {"address", address}, {"write", write}});
                         continue;
                     }
                     Hit("watchpoint", {{"breakpoint", id}, {"address", address}, {"write", write},
@@ -127,6 +132,7 @@ public:
             }
         };
         DebugChannel::guest_log = [this](u32 address, const std::string& text) {
+            if (!Wanted(LOG)) return;
             Record("guest_log", {{"address", address}, {"text", text.substr(0, 8192)}});
         };
         DebugChannel::memory_fault = [this](u32 address,u32 width,bool write) {
@@ -143,6 +149,7 @@ public:
         };
         DebugChannel::svc = [this](u32 id, bool enter) {
             if (!trace_svc && (predicate.is_null() || predicate.value("kind","")!="svc")) return;
+            if (!Wanted(SVC)) return;
             const auto core = system.GetRunningCore().GetID();
             const auto now = system.CoreTiming().GetGlobalTicks();
             if (enter) svc_started[core] = now;
@@ -184,7 +191,7 @@ public:
             s32 error = 38;
             if (function == "write" && (params[0] == 1 || params[0] == 2) && params[2] <= 4096 && params[1] <= 0xffffffff) {
                 const auto data = Read(static_cast<u32>(params[1]), params[2]);
-                Record("hio_stdout", {{"fd", params[0]}, {"text", std::string(data.begin(), data.end())}});
+                if (Wanted(LOG)) Record("hio_stdout", {{"fd", params[0]}, {"text", std::string(data.begin(), data.end())}});
                 retval = params[2];
                 error = 0;
             }
@@ -252,7 +259,7 @@ public:
         scan.clear();
         history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;hits_untracked=false;history_level=3;checkpoint_stats={};
         replaying=false;position_at_hit=false;
-        predicate=nullptr;
+        predicate=nullptr;predicate_mask=0;
         hio_pending = 0;
         stop_reason = Json::object();
         skip_core = 0xffffffff;
@@ -275,7 +282,7 @@ public:
         position_at_hit = std::string{reason} == "breakpoint";
         data["reason"] = reason;
         stop_reason = data;
-        predicate=nullptr;
+        predicate=nullptr;predicate_mask=0;
         std::erase_if(breakpoints, [](const auto& entry) { return entry.second.temporary; });
         SyncExecution();
         for (u32 i = 0; i < system.GetNumCores(); ++i) {
@@ -283,6 +290,7 @@ public:
             system.GetCore(i).PrepareReschedule();
         }
         Record("stopped", data);
+        if (!replaying) stop_reason["sequence"] = event_sequence;
     }
     void Poll() {
         std::deque<std::pair<std::string, Json>> batch;
@@ -299,6 +307,7 @@ public:
         auto& recorder = system.Kernel().GetIPCRecorder();
         if (enabled && !ipc_callback) {
             ipc_callback = recorder.BindCallback([this](const auto& request) {
+                if (!Wanted(IPC)) return;
                 auto raw = request.untranslated_request_cmdbuf;
                 if (raw.size()>64) raw.resize(64);
                 auto reply = request.untranslated_reply_cmdbuf;
@@ -318,9 +327,12 @@ public:
         data["kind"] = kind;
         data["sequence"] = ++event_sequence;
         data["guest_ticks"] = system.IsPoweredOn() ? system.CoreTiming().GetGlobalTicks() : 0;
-        if (events.size() == 1024) { events.pop_front(); ++events_lost; }
-        events.push_back(data);
-        if (notification) notification(data);
+        const auto category = CategoryOf(kind);
+        if (notification && (notify_mask & category)) notification(data, category == STOP);
+        if (history_mask & category) {
+            if (events.size() == 1024) { events.pop_front(); ++events_lost; }
+            events.push_back(data);
+        }
         if(!stopped && !predicate.is_null()) {
             const auto type=predicate.value("kind","");bool matched=false;
             if(type=="svc")matched=std::string{kind}==(predicate.value("enter",true)?"svc_enter":"svc_exit") && data.value("svc",~0u)==predicate.at("id").get<u32>();
@@ -348,6 +360,58 @@ public:
         return {{"events", result}, {"lost_total", events_lost}, {"pending_lost_total",pending_lost.load()},
                 {"latest", event_sequence}, {"next",result.empty()?event_sequence:result.back().at("sequence").get<u64>()},
                 {"history_gap",!events.empty() && after+1<events.front().at("sequence").get<u64>()}};
+    }
+    // Event categories (lotus#26). A category is built only while it is subscribed for
+    // notification, kept for `events`/`logs` (history) or needed by the active run_until
+    // predicate; stops are always kept. SVC, IPC and PICA events additionally need their
+    // explicit switch (trace, gpu_configure).
+    enum Category : u32 { STOP = 1, LOG = 2, NATIVE_LOG = 4, SVC = 8, IPC = 16, PICA = 32, ALL = 63 };
+    static constexpr std::array<std::pair<const char*, u32>, 6> CATEGORIES{{
+        {"stopped", STOP}, {"log", LOG}, {"native_log", NATIVE_LOG}, {"svc", SVC}, {"ipc", IPC}, {"pica", PICA}}};
+    static u32 CategoryOf(std::string_view kind) {
+        if (kind == "guest_log" || kind == "hio_stdout" || kind == "logpoint") return LOG;
+        if (kind == "native_log") return NATIVE_LOG;
+        if (kind == "svc_enter" || kind == "svc_exit") return SVC;
+        if (kind == "ipc") return IPC;
+        if (kind == "pica") return PICA;
+        return STOP;
+    }
+    bool Wanted(u32 category) const {
+        return ((notify_mask | history_mask | predicate_mask) & category) != 0;
+    }
+    static u32 Mask(const Json& names) {
+        if (!names.is_array()) throw std::invalid_argument("event categories must be an array");
+        u32 mask = 0;
+        for (const auto& name : names) {
+            const auto found = std::find_if(CATEGORIES.begin(), CATEGORIES.end(),
+                [&](const auto& c) { return name.is_string() && name.get<std::string>() == c.first; });
+            if (found == CATEGORIES.end()) throw std::invalid_argument("unknown event category");
+            mask |= found->second;
+        }
+        return mask;
+    }
+    static Json Names(u32 mask) {
+        Json names = Json::array();
+        for (const auto& [name, bit] : CATEGORIES) if (mask & bit) names.push_back(name);
+        return names;
+    }
+    // hello: `notifications` (bool, v0.0.3) enables every category unless `subscriptions`
+    // lists them. events_configure: `notify` and/or `history`; omitted fields keep their value.
+    Json ConfigureEvents(const Json& p, bool hello) {
+        if (hello) {
+            const bool enabled = p.is_object() && p.value("notifications", false);
+            notify_mask = !enabled ? 0 : p.contains("subscriptions") ? Mask(p.at("subscriptions")) : ALL;
+            if (p.is_object() && p.contains("history")) history_mask = Mask(p.at("history")) | STOP;
+        } else {
+            if (p.contains("notify")) notify_mask = Mask(p.at("notify"));
+            if (p.contains("history")) history_mask = Mask(p.at("history")) | STOP;
+        }
+        return EventStatus();
+    }
+    Json EventStatus() const {
+        return {{"notify", Names(notify_mask)}, {"history", Names(history_mask)},
+                {"predicate", Names(predicate_mask)}, {"latest", event_sequence},
+                {"history_lost_total", events_lost}, {"pending_lost_total", pending_lost.load()}};
     }
     bool IsStopped() const { return stopped; }
     bool IsGpuReplayView() const { return citrace && citrace->IsReplayView(); }
@@ -651,7 +715,7 @@ public:
     std::function<Json()> get_input;
     std::function<u64()> get_frame;
     std::function<void(u64)> set_frame;
-    std::function<void(const Json&)> notification;
+    std::function<void(const Json&, bool reliable)> notification;
 #endif
 
     std::shared_ptr<Service::CFG::Module> Config() {
@@ -919,6 +983,10 @@ public:
                 result["artifacts"]=Json::array({{{"path","audio/capture.wav"},{"format","wav"}}});
             return result;
         }
+#ifdef CTR_EXPERIMENTAL
+        // Before content too: a host subscribes once, at hello or right after.
+        if (op == "events_configure") return ConfigureEvents(p, false);
+#endif
         if (!system.IsPoweredOn()) throw std::runtime_error("load content first");
         const bool paused = state == "paused";
         Json result;
@@ -1130,6 +1198,7 @@ public:
                 } else if(kind=="draw")gpu->Dispatch({{"operation","gpu_configure"},{"enabled",true},{"stop_events",Json::array()}});
                 else if(kind!="svc"&&kind!="frame")throw std::invalid_argument("unknown predicate");
                 predicate=std::move(next);
+                predicate_mask=kind=="log"?LOG|NATIVE_LOG:kind=="svc"?SVC:kind=="draw"?PICA:0;
                 SyncExecution();
                 return {{"resume_requested",true},{"budget_frames",frames},{"timeout_ms",timeout},{"predicate",predicate}};
             }
@@ -1533,6 +1602,8 @@ private:
     std::array<u64,4> svc_started{};
     std::map<u64, Breakpoint> breakpoints;
     u64 next_breakpoint = 0, event_sequence = 0, events_lost = 0;
+    // Read by the native log observer on logging threads.
+    std::atomic<u32> notify_mask{0}, history_mask{ALL}, predicate_mask{0};
     std::deque<Json> events;
     bool stopped = false, stepping = false, trace_svc = false, hio_forward = false;
     u32 hio_pending = 0;
