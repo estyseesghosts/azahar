@@ -27,6 +27,7 @@ public:
         Settings::values.output_type = AudioCore::SinkType::Worker;
         Frontend::control_callback = [this] { Drain(true); };
         std::thread reader{[this] {
+            stdin_reader.Enter();
             while (!stopping) {
                 Json request;
                 if (!Receive(request, stopping))
@@ -40,6 +41,7 @@ public:
                 system.NotifyPendingWork();
             }
             disconnected = true;
+            stdin_reader.Exit();
             system.NotifyPendingWork();
         }};
         try {
@@ -73,6 +75,7 @@ public:
             exit_code = 1;
         }
         stopping = true;
+        stdin_reader.Interrupt();
         reader.join();
         Frontend::control_callback = {};
         if (system.IsPoweredOn())
@@ -392,5 +395,6 @@ private:
     std::mutex mutex;
     std::deque<Json> queue;
     std::atomic_bool stopping = false, disconnected = false;
+    StdinReader stdin_reader;
 };
 } // namespace CtrWorker

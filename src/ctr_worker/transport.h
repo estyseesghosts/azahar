@@ -17,21 +17,52 @@
 #endif
 
 namespace CtrWorker {
-// Poll inherited stdin so stopping can join the reader without orphan threads.
+// Ends a reader thread blocked in a stdin read so stopping can join it without orphan
+// threads. Windows reads block in ReadFile and are cancelled with CancelSynchronousIo. The
+// earlier PeekNamedPipe loop slept sleep_for(1 ms) on an empty pipe, which lasts until the
+// next timer tick (about 15.6 ms at the default resolution) and so delayed every request by
+// up to a tick: Lotus measured 14.8 ms p50 for `registers` on a running worker (lotus#22,
+// tools/bench_parallel.py, runs/bp-real-02).
+class StdinReader {
+public:
+    // On the reader thread, before its first read.
+    void Enter() {
+#ifdef _WIN32
+        HANDLE self = nullptr;
+        if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0,
+                            FALSE, DUPLICATE_SAME_ACCESS))
+            thread = self;
+#endif
+    }
+    // On the reader thread, after its last read.
+    void Exit() { done = true; }
+    // From another thread once `stop` is set: unblock the read and wait for Exit. Repeated
+    // because a cancel issued before the reader enters ReadFile has nothing to cancel.
+    void Interrupt() {
+#ifdef _WIN32
+        while (!done) {
+            if (const HANDLE handle = thread)
+                CancelSynchronousIo(handle);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (const HANDLE handle = thread.exchange(nullptr))
+            CloseHandle(handle);
+#endif
+    }
+
+private:
+    std::atomic_bool done = false;
+#ifdef _WIN32
+    std::atomic<HANDLE> thread = nullptr;
+#endif
+};
 inline bool ReadExact(char* data, size_t size, const std::atomic_bool& stop) {
     while (size && !stop) {
 #ifdef _WIN32
-        DWORD available = 0;
-        const auto handle = GetStdHandle(STD_INPUT_HANDLE);
-        if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr))
-            return false;
-        if (!available) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
+        // Blocks until bytes arrive, the host closes the pipe, or StdinReader::Interrupt.
         DWORD received = 0;
-        if (!ReadFile(handle, data, static_cast<DWORD>(std::min<size_t>(size, available)),
-                      &received, nullptr) ||
+        if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), data,
+                      static_cast<DWORD>(std::min<size_t>(size, 65536)), &received, nullptr) ||
             !received)
             return false;
 #else
