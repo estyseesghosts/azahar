@@ -21,6 +21,7 @@ public:
     explicit Control(std::string root) : root(std::filesystem::absolute(root)) {}
     int Run() {
         ReserveControlOutput();
+        writer.Start();
         Initialize(system, root.string(), unsupported);
         RegisterInput(input);
         RegisterCamera();
@@ -45,7 +46,7 @@ public:
             system.NotifyPendingWork();
         }};
         try {
-            while (!stopping && !disconnected) {
+            while (!stopping && !disconnected && !writer.Failed()) {
                 Drain(false);
                 if (state == "running") {
                     const auto result = system.RunLoop();
@@ -78,6 +79,8 @@ public:
             std::cerr << "worker_control_error: " << error.what() << '\n';
             exit_code = 1;
         }
+        if (writer.Failed())
+            exit_code = 1;
         stopping = true;
         stdin_reader.Interrupt();
         reader.join();
@@ -85,6 +88,7 @@ public:
         if (system.IsPoweredOn())
             system.Shutdown();
         AudioCore::WorkerSink::CaptureStop();
+        writer.Close();
         Common::Log::Stop();
         return exit_code;
     }
@@ -98,10 +102,11 @@ private:
                 {"audio_samples", audio.samples},   {"audio_dropped", audio.dropped},
                 {"audio_focused", AudioCore::WorkerSink::focused},
                 {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered},
-                {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"}};
+                {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"},
+                {"transport", writer.Stats()}};
     }
     void Reply(const Json& request, const std::string& status, Json data = nullptr) {
-        Send({{"version_major", 1},
+        writer.Post({{"version_major", 1},
               {"version_minor", 0},
               {"request_id", request.at("request_id")},
               {"session", request.at("session")},
@@ -109,7 +114,8 @@ private:
               {"status", status},
               {"state", state},
               {"backend", "azahar_native_software"},
-              {"data", std::move(data)}});
+              {"data", std::move(data)}},
+             true);
     }
     void Drain(bool nested) {
         // Never destroy/reinitialize a core while inside its RunLoop/frame limiter.
@@ -400,5 +406,6 @@ private:
     std::deque<Json> queue;
     std::atomic_bool stopping = false, disconnected = false;
     StdinReader stdin_reader;
+    ControlWriter writer;
 };
 } // namespace CtrWorker

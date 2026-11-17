@@ -1,7 +1,9 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -127,18 +129,127 @@ inline void WriteControl(const char* data, size_t size) {
         size -= static_cast<size_t>(written);
     }
 }
-inline void Send(const nlohmann::json& reply) {
-    const auto payload = reply.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+// A length-prefixed frame, or empty when the payload exceeds the 64 KiB control bound.
+inline std::string Frame(const nlohmann::json& message) {
+    const auto payload = message.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     if (payload.size() > 65536)
-        throw std::runtime_error("reply exceeds control bound");
-    if (ControlOutput() < 0)
-        throw std::runtime_error("control output not reserved");
+        return {};
     std::string frame(4, '\0');
     for (unsigned i = 0; i < 4; ++i)
         frame[i] = static_cast<char>(payload.size() >> (i * 8));
-    frame += payload;
-    static std::mutex mutex;
-    std::scoped_lock lock{mutex};
-    WriteControl(frame.data(), frame.size());
+    return frame + payload;
 }
+// Serializes and writes control frames on its own thread, so the emulation thread never
+// formats a frame or blocks on the pipe (lotus#26). Before, every reply and notification was
+// dumped and written synchronously by the thread that produced it; a host that read slowly
+// stalled emulation, and every PICA, SVC or log event cost a pipe write. Replies and reliable
+// notifications (debug stops) keep their order and are never dropped; they are bounded by
+// the request queue (16) and by one stop per resume. Best-effort notifications are bounded
+// at BEST_EFFORT_LIMIT: a new one past the bound drops the oldest queued one, counted in
+// `dropped` and reported in every later notification as `notifications_dropped`.
+class ControlWriter {
+public:
+    static constexpr size_t BEST_EFFORT_LIMIT = 1024;
+    void Start() {
+        if (ControlOutput() < 0)
+            throw std::runtime_error("control output not reserved");
+        thread = std::thread([this] { Loop(); });
+    }
+    void Post(nlohmann::json message, bool reliable) {
+        {
+            std::scoped_lock lock{mutex};
+            if (failed || closing)
+                return;
+            if (!reliable) {
+                if (best_effort == BEST_EFFORT_LIMIT) {
+                    for (auto entry = queue.begin(); entry != queue.end(); ++entry) {
+                        if (!entry->reliable) {
+                            queue.erase(entry);
+                            break;
+                        }
+                    }
+                    ++dropped;
+                } else {
+                    ++best_effort;
+                }
+            }
+            queue.push_back({std::move(message), reliable});
+            peak = std::max(peak, queue.size());
+        }
+        ready.notify_one();
+    }
+    // Writes everything already queued, then ends the thread. Blocks while the host does not
+    // read, as the synchronous writes did.
+    void Close() {
+        {
+            std::scoped_lock lock{mutex};
+            closing = true;
+        }
+        ready.notify_one();
+        if (thread.joinable())
+            thread.join();
+    }
+    bool Failed() const {
+        return failed;
+    }
+    nlohmann::json Stats() {
+        std::scoped_lock lock{mutex};
+        return {{"queued", queue.size()},     {"best_effort_queued", best_effort},
+                {"best_effort_limit", BEST_EFFORT_LIMIT}, {"peak", peak},
+                {"written", written},         {"dropped", dropped},
+                {"oversize_dropped", oversize}};
+    }
+
+private:
+    struct Entry {
+        nlohmann::json message;
+        bool reliable;
+    };
+    void Loop() {
+        for (;;) {
+            Entry entry;
+            {
+                std::unique_lock lock{mutex};
+                ready.wait(lock, [this] { return !queue.empty() || closing; });
+                if (queue.empty())
+                    return;
+                entry = std::move(queue.front());
+                queue.pop_front();
+                if (!entry.reliable)
+                    --best_effort;
+                if (entry.message.contains("notification"))
+                    entry.message["notifications_dropped"] = dropped;
+            }
+            const auto frame = Frame(entry.message);
+            try {
+                if (frame.empty()) {
+                    // A reply must never be lost; an oversized event is dropped and counted.
+                    if (entry.reliable)
+                        throw std::runtime_error("reply exceeds control bound");
+                    std::scoped_lock lock{mutex};
+                    ++oversize;
+                    continue;
+                }
+                WriteControl(frame.data(), frame.size());
+            } catch (const std::exception& error) {
+                std::cerr << "worker_control_error: " << error.what() << '\n';
+                std::scoped_lock lock{mutex};
+                failed = true;
+                queue.clear();
+                best_effort = 0;
+                return;
+            }
+            std::scoped_lock lock{mutex};
+            ++written;
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<Entry> queue;
+    std::thread thread;
+    size_t best_effort = 0, peak = 0;
+    unsigned long long written = 0, dropped = 0, oversize = 0;
+    bool closing = false;
+    std::atomic_bool failed = false;
+};
 } // namespace CtrWorker
