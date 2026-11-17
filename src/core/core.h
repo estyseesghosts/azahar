@@ -7,6 +7,7 @@
 #include <atomic>
 #include <span>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -421,6 +422,13 @@ public:
     /// As above without copying the caller's buffer.
     bool LoadStateBuffer(std::span<const u8> buffer);
 
+    /// Serializes as SaveStateBuffer() does, without header or compression, and records the
+    /// byte offset at the end of each top-level section of serialize() in `marks`, so callers
+    /// can hash sections separately (CITnLO state_hash, lotus#29). Has the same side effects
+    /// as a save: GPU caches are flushed and cross-thread timing events are queued.
+    void SerializeSections(std::vector<u8>& out,
+                           std::vector<std::pair<const char*, std::size_t>>& marks);
+
     /// Applies any changes to settings to this core instance.
     void ApplySettings();
 
@@ -566,6 +574,8 @@ private:
     std::atomic_bool is_powered_on{};
 
     SaveStateStatus save_state_status = SaveStateStatus::NONE;
+    /// Set only during SerializeSections(); serialize() calls it after each section it saves.
+    std::function<void(const char*)> serialize_mark;
     SaveStateStatus save_state_request_status = SaveStateStatus::NONE;
     u32 save_state_slot = 0;
     std::chrono::steady_clock::time_point save_state_request_time{};

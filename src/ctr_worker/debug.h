@@ -52,6 +52,11 @@ inline void DefaultProfile() {
     Settings::values.init_ticks_override = 0;
     Settings::values.init_clock = Settings::InitClock::FixedTime;
     Settings::values.init_time = 946684800;
+    // HLE async sections (hle_ipc.h RunAsync/RunOnThreadWorker) otherwise run on host threads and
+    // wake the guest thread when the host finishes, so the wake tick follows host timing and two
+    // runs of the same ROM diverge. On, they run on the emulation thread and sleep their emulated
+    // delay (lotus#29). Upstream default is off.
+    Settings::values.deterministic_async_operations = true;
 }
 class DebugTools {
 public:
@@ -785,6 +790,87 @@ public:
                 {"thread", thread ? thread->thread_id : 0}, {"mode", context.cpsr & 31},
                 {"safe_point", true}, {"spsr_available", false}};
     }
+    // Per-component hashes of the paused guest, for finding the first state two runs disagree
+    // on (lotus#29). `memory`: FCRAM, VRAM, DSP RAM and New 3DS extra RAM in `chunk_kib`
+    // pieces, so a difference has a physical address. `cpu`: each core's context and timer.
+    // `sections`: each top-level part of System::serialize (timing queue, services, archives,
+    // DSP, memory with page tables, kernel, GPU); skipped while an async HLE operation runs on
+    // a host thread, which save_state refuses for the same reason. Serializing has a save's side
+    // effects (GPU cache flush, cross-thread timing events queued), as a rewind checkpoint does,
+    // so runs being compared must all hash at the same frames.
+    // `dump`: also write the serialized bytes and section offsets to <root>/state-dumps/<dump>.bin
+    // and .json, for comparing the bytes of a differing section.
+    Json StateHash(u32 chunk_kib, bool sections, const std::string& dump) {
+        if (chunk_kib < 4 || chunk_kib > 65536 || (chunk_kib & (chunk_kib - 1)))
+            throw std::invalid_argument("chunk_kib: power of two, 4..65536");
+        const auto hex = [](u64 value) { return fmt::format("{:016x}", value); };
+        const bool n3ds = Settings::values.is_new_3ds.GetValue();
+        const size_t chunk = size_t(chunk_kib) << 10;
+        Json memory = Json::object();
+        const auto region = [&](const char* name, PAddr base, size_t size) {
+            if (!size) return;
+            const u8* data = system.Memory().GetPhysicalPointer(base);
+            if (!data) throw std::runtime_error("unmapped physical region");
+            Json chunks = Json::array();
+            for (size_t offset = 0; offset < size; offset += chunk)
+                chunks.push_back(hex(Common::ComputeHash64(data + offset, std::min(chunk, size - offset))));
+            memory[name] = {{"base", base}, {"size", size}, {"chunks", chunks}};
+        };
+        region("fcram", Memory::FCRAM_PADDR, n3ds ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE);
+        region("vram", Memory::VRAM_PADDR, Memory::VRAM_SIZE);
+        region("dsp_ram", Memory::DSP_RAM_PADDR, Memory::DSP_RAM_SIZE);
+        region("n3ds_extra_ram", Memory::N3DS_EXTRA_RAM_PADDR, n3ds ? Memory::N3DS_EXTRA_RAM_SIZE : 0);
+        Json cpu = Json::array();
+        for (u32 id = 0; id < system.GetNumCores(); ++id) {
+            Core::ARM_Interface::ThreadContext context;
+            system.GetCore(id).SaveContext(context);
+            const auto thread = system.Kernel().GetThreadManager(id).GetCurrentThread();
+            const auto timer = system.CoreTiming().GetTimer(id);
+            const auto state = Json{context.cpu_registers, context.cpsr, context.fpu_registers,
+                                    context.fpscr, context.fpexc}.dump();
+            cpu.push_back({{"core", id}, {"pc", context.cpu_registers[15]},
+                {"thread", thread ? thread->thread_id : 0}, {"ticks", timer->GetTicks()},
+                {"idle_ticks", timer->GetIdleTicks()},
+                {"context", hex(Common::ComputeHash64(state.data(), state.size()))}});
+        }
+        const bool async_pending = system.Kernel().AreAsyncOperationsPending();
+        Json result = {{"guest_ticks", system.CoreTiming().GetGlobalTicks()}, {"cpu", cpu},
+            {"memory", memory}, {"chunk_kib", chunk_kib}, {"async_pending", async_pending},
+            {"sections", nullptr}};
+        if (sections && !async_pending) {
+            std::vector<u8> bytes;
+            std::vector<std::pair<const char*, std::size_t>> marks;
+            ArmWatches(false);
+            try { system.SerializeSections(bytes, marks); } catch (...) { ArmWatches(true); throw; }
+            ArmWatches(true);
+            Json list = Json::array();
+            std::size_t start = 0;
+            for (const auto& [name, end] : marks) {
+                list.push_back({{"name", name}, {"bytes", end - start},
+                    {"hash", hex(Common::ComputeHash64(bytes.data() + start, end - start))}});
+                start = end;
+            }
+            result["sections"] = list;
+            result["serialized_hash"] = hex(Common::ComputeHash64(bytes.data(), bytes.size()));
+            if (!dump.empty()) {
+                if (dump.size() > 32 || dump.find_first_not_of(
+                        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos)
+                    throw std::invalid_argument("invalid dump name");
+                const auto directory = root / "state-dumps";
+                std::filesystem::create_directories(directory);
+                std::ofstream file(directory / (dump + ".bin"), std::ios::binary | std::ios::trunc);
+                file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                file.close();
+                if (!file) throw std::runtime_error(fmt::format("dump .bin: {}", std::strerror(errno)));
+                std::ofstream offsets(directory / (dump + ".json"));
+                offsets << list.dump();
+                offsets.close();
+                if (!offsets) throw std::runtime_error(fmt::format("dump .json: {}", std::strerror(errno)));
+                result["dump"] = (directory / (dump + ".bin")).string();
+            }
+        }
+        return result;
+    }
     void CheckMemory(u32 address, size_t length) {
         const auto process = system.Kernel().GetCurrentProcess();
         if (!process || !length || length > 4096 || u64(address) + length > 0x100000000ull)
@@ -1180,6 +1266,7 @@ public:
             if (op == "rewind_status")return HistoryStatus();
             if (op == "trace") { SetTrace(p.at("enabled")); return {{"enabled", trace_svc}, {"ipc",trace_svc}}; }
             if (!paused) throw std::invalid_argument("mutation requires paused execution");
+            if (op == "state_hash") return StateHash(p.value("chunk_kib", 1024u), p.value("sections", true), p.value("dump", std::string{}));
             if(op=="run_until") {
                 auto next=p.at("predicate");const auto kind=next.at("kind").get<std::string>();
                 const auto frames=p.at("frames").get<u32>(),timeout=p.at("timeout_ms").get<u32>();

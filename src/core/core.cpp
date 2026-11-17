@@ -2,6 +2,7 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <array>
 #include <stdexcept>
 #include <utility>
 #include <boost/serialization/array.hpp>
@@ -1026,15 +1027,27 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
             Init(*m_emu_window, m_secondary_window, mem_mode, num_cores);
     }
 
+    const auto mark = [this](const char* section) {
+        if (Archive::is_saving::value && serialize_mark) {
+            serialize_mark(section);
+        }
+    };
+    mark("system");
+
     // Flush on save, don't flush on load
     const bool should_flush = !Archive::is_loading::value;
     gpu->ClearAll(should_flush);
     ar&* timing.get();
+    mark("timing");
+    static constexpr std::array<const char*, 4> cpu_sections{"cpu0", "cpu1", "cpu2", "cpu3"};
     for (u32 i = 0; i < num_cores; i++) {
         ar&* cpu_cores[i].get();
+        mark(i < cpu_sections.size() ? cpu_sections[i] : "cpu");
     }
     ar&* service_manager.get();
+    mark("services");
     ar&* archive_manager.get();
+    mark("archives");
 
     // NOTE: DSP doesn't like being destroyed and recreated. So instead we do an inline
     // serialization; this means that the DSP Settings need to match for loading to work.
@@ -1044,11 +1057,16 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     } else {
         throw std::runtime_error("LLE audio not supported for save states");
     }
+    mark("dsp");
 
     ar&* memory.get();
+    mark("memory");
     ar&* kernel.get();
+    mark("kernel");
     ar&* gpu.get();
+    mark("gpu");
     ar & movie;
+    mark("movie");
 
     // This needs to be set from somewhere - might as well be here!
     if (Archive::is_loading::value) {
@@ -1088,6 +1106,7 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     } else {
         u32 cheats_pid = cheat_engine.GetConnectedPID();
         ar & cheats_pid;
+        mark("cheats");
     }
 
     save_state_status = SaveStateStatus::NONE;

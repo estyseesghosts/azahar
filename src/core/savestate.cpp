@@ -335,6 +335,25 @@ std::vector<u8> System::SaveStateBuffer(int compression_level, SaveStateTiming* 
     return result;
 }
 
+void System::SerializeSections(std::vector<u8>& out,
+                               std::vector<std::pair<const char*, std::size_t>>& marks) {
+    out.clear();
+    marks.clear();
+    out.reserve(last_serialized_size.load(std::memory_order_relaxed));
+    // VectorWriteBuffer has no put area, so out.size() is exact at every mark.
+    serialize_mark = [&](const char* section) { marks.emplace_back(section, out.size()); };
+    try {
+        VectorWriteBuffer buffer{out};
+        std::ostream stream{&buffer};
+        oarchive oa{stream};
+        oa&* this;
+    } catch (...) {
+        serialize_mark = nullptr;
+        throw;
+    }
+    serialize_mark = nullptr;
+}
+
 bool System::LoadStateBuffer(std::vector<u8> buffer) {
     return LoadStateBuffer(std::span<const u8>{buffer});
 }
