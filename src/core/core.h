@@ -144,6 +144,14 @@ public:
     void ProcessPendingWorkUntil(std::chrono::steady_clock::time_point deadline);
 
     /**
+     * Runs ProcessPendingWork, then sleeps until the deadline or NotifyPendingWork and, if
+     * notified, runs it once more and returns. Unlike ProcessPendingWorkUntil it never waits
+     * out the deadline after new work arrives, so an idle caller can handle that work at once.
+     * Must be called from the emulation thread.
+     */
+    void ProcessPendingWorkOrWait(std::chrono::steady_clock::time_point deadline);
+
+    /**
      * Wakes up the emulation thread if it is waiting in ProcessPendingWorkUntil, so that newly
      * queued work is processed right away. This function is thread safe.
      */

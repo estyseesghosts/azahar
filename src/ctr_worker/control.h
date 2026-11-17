@@ -66,8 +66,12 @@ public:
                         }
                     }
                 } else {
-                    system.ProcessPendingWorkUntil(std::chrono::steady_clock::now() +
-                                                   std::chrono::milliseconds(10));
+                    // Returns as soon as the reader queues a request. ProcessPendingWorkUntil
+                    // waited out the deadline after a request arrived, so every request that
+                    // is not drained nested (run_until, input, preview, pause, debug commands)
+                    // waited up to one 15.6 ms timer tick on a paused worker (lotus#22).
+                    system.ProcessPendingWorkOrWait(std::chrono::steady_clock::now() +
+                                                    std::chrono::milliseconds(10));
                 }
             }
         } catch (const std::exception& error) {

@@ -342,6 +342,13 @@ void System::ProcessPendingWorkUntil(std::chrono::steady_clock::time_point deadl
     } while (pending_work_event.WaitUntil(deadline));
 }
 
+void System::ProcessPendingWorkOrWait(std::chrono::steady_clock::time_point deadline) {
+    ProcessPendingWork();
+    if (pending_work_event.WaitUntil(deadline)) {
+        ProcessPendingWork();
+    }
+}
+
 void System::NotifyPendingWork() {
     pending_work_event.Set();
 }
