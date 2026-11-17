@@ -372,7 +372,7 @@ private:
                     Reply(request, "not_ready");
                     return;
                 }
-                Reply(request, "ok", preview.Write(system, epoch, window.frames));
+                Reply(request, "ok", preview.Write(system, epoch, window.frames, state == "running"));
             } else if (method == "input") {
                 if((system.Movie().GetPlayMode()==Core::Movie::PlayMode::Playing || system.Movie().GetPlayMode()==Core::Movie::PlayMode::MovieFinished))throw std::invalid_argument("movie playback owns input");
                 const auto requested_owner = params.at("owner").get<std::string>();

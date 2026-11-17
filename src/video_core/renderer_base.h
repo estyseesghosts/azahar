@@ -3,6 +3,7 @@
 // Refer to the LICENSE.txt file included.
 
 #pragma once
+#include <array>
 #include <stdexcept>
 
 #include "common/common_types.h"
@@ -47,13 +48,32 @@ public:
         throw std::runtime_error("offscreen capture unsupported by renderer");
     }
 
-    /// Live-preview readback for `stream` (one per screen). May return an earlier request's
-    /// pixels instead of waiting for the GPU; returns the `frame_id` the pixels belong to.
-    /// The default is the synchronous capture.
-    virtual u64 PreviewOffscreen(void* pixels, const Layout::FramebufferLayout& layout, u32 stream,
-                                 u64 frame_id) {
-        CaptureOffscreen(pixels, layout);
+    /// Counters of the live-preview readback since the renderer was created.
+    struct PreviewStats {
+        u64 readbacks = 0;     ///< Screen pairs whose copy was submitted.
+        u64 skipped_busy = 0;  ///< Requests that submitted nothing: every slot still in flight.
+        u64 stale = 0;         ///< Requests with no newer completed pair to copy.
+        u64 gpu_waits = 0;     ///< Waits for the GPU, only on paused requests.
+        u64 gpu_wait_ns = 0;
+        u64 copied_bytes = 0;  ///< Bytes copied out of staging memory.
+    };
+
+    /// Live preview of both screens (`layouts[0]` top, `[1]` bottom) into `pixels`. Copies the
+    /// newest frame whose two readbacks have completed and whose id is at least `oldest`, then
+    /// submits readbacks of the current frame `frame_id`. Waits for the GPU only when
+    /// `may_wait` (a paused worker, where waiting stalls no emulation); the result is then
+    /// `frame_id`. Returns the id of the copied pair, or 0 when none qualifies and `pixels`
+    /// were not written. The default is the synchronous capture.
+    virtual u64 PreviewScreens(const std::array<void*, 2>& pixels,
+                               const std::array<Layout::FramebufferLayout, 2>& layouts, u64 frame_id,
+                               u64 oldest, bool may_wait) {
+        CaptureOffscreen(pixels[0], layouts[0]);
+        CaptureOffscreen(pixels[1], layouts[1]);
         return frame_id;
+    }
+
+    virtual PreviewStats PreviewStatistics() const {
+        return {};
     }
 
     /// Returns the rasterizer owned by the renderer
