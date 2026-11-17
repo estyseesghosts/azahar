@@ -70,7 +70,7 @@ private:
 
     Core::Timing& timing;
     Core::Movie& movie;
-    u8 hid_period;
+    u8 hid_period = 0; // set by the guest's polling request; initialized for savestates (lotus#29)
     Core::TimingEventType* hid_polling_callback_id;
     std::array<u8, 0x40> calibration_data;
     std::unique_ptr<Input::ButtonDevice> zl;

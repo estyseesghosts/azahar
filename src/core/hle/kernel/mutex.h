@@ -35,8 +35,10 @@ public:
     }
 
     std::shared_ptr<ResourceLimit> resource_limit;
-    int lock_count;   ///< Number of times the mutex has been acquired
-    u32 priority;     ///< The priority of the mutex, used for priority inheritance.
+    int lock_count = 0; ///< Number of times the mutex has been acquired
+    /// The priority of the mutex, used for priority inheritance. Set on acquire; initialized so
+    /// an unheld mutex serializes the same bytes in every run (lotus#29).
+    u32 priority = 0;
     std::string name; ///< Name of mutex (optional)
     std::shared_ptr<Thread> holding_thread; ///< Thread that has acquired the mutex
 
