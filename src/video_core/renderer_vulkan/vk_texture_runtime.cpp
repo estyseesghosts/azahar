@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_texture_runtime.h"
 
 #include <vk_mem_alloc.h>
+#include "video_core/renderer_vulkan/vk_gpu_error.h"
 #include <vulkan/vulkan_format_traits.hpp>
 
 MICROPROFILE_DEFINE(Vulkan_ImageAlloc, "Vulkan", "Texture Allocation", MP_RGB(192, 52, 235));
@@ -218,12 +219,8 @@ void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::For
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &allocation, nullptr);
-    if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating image with error {}", result);
-        UNREACHABLE();
-    }
+    CreateImage(instance.GetAllocator(), unsafe_image_info, alloc_info, &unsafe_image,
+                &allocation, nullptr, "surface image");
 
     image = vk::Image{unsafe_image};
 
@@ -1258,7 +1255,7 @@ vk::PipelineStageFlags Surface::PipelineStageFlags() const noexcept {
                        : vk::PipelineStageFlagBits::eNone);
 }
 
-vk::ImageView Surface::CopyImageView() noexcept {
+vk::ImageView Surface::CopyImageView() {
     auto& copy_handle = handles[Type::Copy];
     vk::ImageLayout copy_layout = vk::ImageLayout::eGeneral;
     if (!copy_handle) {
@@ -1362,7 +1359,7 @@ vk::ImageView Surface::CopyImageView() noexcept {
     return copy_handle.image_views[ViewType::Sample];
 }
 
-vk::ImageView Surface::ImageView(ViewType view_type, Type type) noexcept {
+vk::ImageView Surface::ImageView(ViewType view_type, Type type) {
     auto& handle = handles[type == Type::Current ? current : type];
     if (auto image_view = handle.image_views[view_type]) {
         return image_view;
@@ -1400,7 +1397,7 @@ vk::ImageView Surface::ImageView(ViewType view_type, Type type) noexcept {
     return handle.image_views[view_type];
 }
 
-vk::Framebuffer Surface::Framebuffer(Type type) noexcept {
+vk::Framebuffer Surface::Framebuffer(Type type) {
     type = (type == Type::Current) ? current : type;
     auto& handle = handles[type];
     if (handle.framebuffer) {

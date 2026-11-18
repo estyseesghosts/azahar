@@ -7,6 +7,7 @@
 #include "common/alignment.h"
 #include "common/hash.h"
 #include "common/microprofile.h"
+#include "video_core/renderer_vulkan/vk_gpu_error.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -101,7 +102,17 @@ bool GraphicsPipeline::TryBuild(bool wait_built) {
     }
 
     // Fallback to (a)synchronous compilation
-    worker->QueueWork([this] { Build(); });
+    worker->QueueWork([this] {
+        try {
+            Build();
+        } catch (const std::exception& error) {
+            // A compile thread cannot throw to the emulation thread: latch the fault and let
+            // waiters go; the scheduler drops later work and the next wait rethrows.
+            const auto gpu = AsGpuError(error);
+            RaiseFault(gpu ? *gpu : GpuError{GpuErrorKind::Other, VK_ERROR_UNKNOWN, error.what()});
+            MarkDone();
+        }
+    });
     is_pending = true;
     return wait_built;
 }
@@ -311,7 +322,7 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
     } else if (result.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
         return false;
     } else {
-        UNREACHABLE_MSG("Graphics pipeline creation failed!");
+        ThrowGpuError(static_cast<VkResult>(result.result), "graphics pipeline");
     }
 
     MarkDone();

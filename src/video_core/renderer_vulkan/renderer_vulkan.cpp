@@ -25,6 +25,7 @@
 #include "video_core/host_shaders/vulkan_cursor_vert.h"
 
 #include <vk_mem_alloc.h>
+#include "video_core/renderer_vulkan/vk_gpu_error.h"
 #if defined(__APPLE__) && !defined(HAVE_LIBRETRO)
 #include "common/apple_utils.h"
 #endif
@@ -648,12 +649,8 @@ void RendererVulkan::ConfigureFramebufferTexture(TextureInfo& texture,
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &texture.allocation, nullptr);
-    if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}", result);
-        UNREACHABLE();
-    }
+    CreateImage(instance.GetAllocator(), unsafe_image_info, alloc_info, &unsafe_image,
+                &texture.allocation, nullptr, "screen texture");
     texture.image = vk::Image{unsafe_image};
 
     const vk::ImageViewCreateInfo view_info = {
@@ -1521,12 +1518,8 @@ void RendererVulkan::RenderScreenshotWithStagingCopy() {
     VmaAllocationInfo alloc_info;
     VkBufferCreateInfo unsafe_buffer_info = static_cast<VkBufferCreateInfo>(staging_buffer_info);
 
-    VkResult result = vmaCreateBuffer(instance.GetAllocator(), &unsafe_buffer_info,
-                                      &alloc_create_info, &unsafe_buffer, &allocation, &alloc_info);
-    if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}", result);
-        UNREACHABLE();
-    }
+    CreateBuffer(instance.GetAllocator(), unsafe_buffer_info, alloc_create_info, &unsafe_buffer,
+                 &allocation, &alloc_info, "screenshot staging buffer");
 
     vk::Buffer staging_buffer{unsafe_buffer};
 

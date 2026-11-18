@@ -6,6 +6,7 @@
 #include <utility>
 #include "common/microprofile.h"
 #include "common/thread.h"
+#include "video_core/renderer_vulkan/vk_gpu_error.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #ifdef HAVE_LIBRETRO
@@ -88,9 +89,11 @@ void Scheduler::WaitWorker() {
     // Now wait for execution to finish.
     // This needs to be done in the same order as WorkerThread.
     std::scoped_lock el{execution_mutex};
+    ThrowIfFaulted();
 }
 
 void Scheduler::Wait(u64 tick) {
+    ThrowIfFaulted();
     if (tick >= master_semaphore->CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         Flush();
@@ -150,11 +153,20 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
-            work->ExecuteAll(current_cmdbuf);
-
-            // If the chunk was a submission, reallocate the command buffer.
-            if (has_submit) {
-                AllocateWorkerCommandBuffers();
+            // After a fault the chunk is dropped unexecuted (lotus#46): the queue still drains,
+            // so WaitWorker returns and the emulation thread rethrows the fault.
+            if (!Faulted()) {
+                try {
+                    work->ExecuteAll(current_cmdbuf);
+                    // If the chunk was a submission, reallocate the command buffer.
+                    if (has_submit) {
+                        AllocateWorkerCommandBuffers();
+                    }
+                } catch (const std::exception& error) {
+                    const auto gpu = AsGpuError(error);
+                    RaiseFault(gpu ? *gpu
+                                   : GpuError{GpuErrorKind::Other, VK_ERROR_UNKNOWN, error.what()});
+                }
             }
         }
 

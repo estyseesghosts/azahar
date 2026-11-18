@@ -62,23 +62,40 @@ public:
         return values[id.index].object;
     }
 
+    // T's constructor may throw (a Vulkan surface whose allocation fails, lotus#46). The vector
+    // is then left as it was: the index returns to the free list and, for swap_and_insert, the
+    // existing value is moved back. T's move constructor must not throw.
     template <typename... Args>
-    [[nodiscard]] SlotId insert(Args&&... args) noexcept {
+    [[nodiscard]] SlotId insert(Args&&... args) {
         const u32 index = FreeValueIndex();
-        new (&values[index].object) T(std::forward<Args>(args)...);
+        try {
+            new (&values[index].object) T(std::forward<Args>(args)...);
+        } catch (...) {
+            free_list.push_back(index);
+            throw;
+        }
         SetStorageBit(index);
 
         return SlotId{index};
     }
 
     template <typename... Args>
-    [[nodiscard]] SlotId swap_and_insert(SlotId existing_id, Args&&... args) noexcept {
+    [[nodiscard]] SlotId swap_and_insert(SlotId existing_id, Args&&... args) {
+        static_assert(std::is_nothrow_move_constructible_v<T>);
         const u32 index = FreeValueIndex();
         T& existing_value = values[existing_id.index].object;
 
         new (&values[index].object) T(std::move(existing_value));
         existing_value.~T();
-        new (&values[existing_id.index].object) T(std::forward<Args>(args)...);
+        try {
+            new (&values[existing_id.index].object) T(std::forward<Args>(args)...);
+        } catch (...) {
+            T& moved = values[index].object;
+            new (&values[existing_id.index].object) T(std::move(moved));
+            moved.~T();
+            free_list.push_back(index);
+            throw;
+        }
         SetStorageBit(index);
 
         return SlotId{index};

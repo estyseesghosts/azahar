@@ -11,6 +11,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/literals.h"
+#include "video_core/renderer_vulkan/vk_gpu_error.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_memory_util.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -259,9 +260,9 @@ void StreamBuffer::CreateBuffers(u64 preferred_size) {
         }
     }
 
-    UNREACHABLE_MSG("Failed to allocate {} buffer of preferred size {} KiB (flags {})",
-                    BufferTypeName(type), preferred_size / 1024,
-                    vk::to_string(mem_type.propertyFlags));
+    ThrowGpuError(VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                  fmt::format("{} stream buffer, preferred {} KiB", BufferTypeName(type),
+                              preferred_size / 1024));
 }
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {

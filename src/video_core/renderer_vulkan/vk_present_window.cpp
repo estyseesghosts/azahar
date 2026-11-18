@@ -14,6 +14,7 @@
 #include "vk_platform.h"
 
 #include <vk_mem_alloc.h>
+#include "video_core/renderer_vulkan/vk_gpu_error.h"
 
 MICROPROFILE_DEFINE(Vulkan_WaitPresent, "Vulkan", "Wait For Present", MP_RGB(128, 128, 128));
 
@@ -209,12 +210,8 @@ void PresentWindow::RecreateFrame(Frame* frame, u32 width, u32 height) {
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &frame->allocation, nullptr);
-    if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}", result);
-        UNREACHABLE();
-    }
+    CreateImage(instance.GetAllocator(), unsafe_image_info, alloc_info, &unsafe_image,
+                &frame->allocation, nullptr, "present frame");
     frame->image = vk::Image{unsafe_image};
 
     const vk::ImageViewCreateInfo view_info = {

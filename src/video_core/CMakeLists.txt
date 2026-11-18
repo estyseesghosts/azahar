@@ -179,6 +179,9 @@ if (ENABLE_VULKAN)
         renderer_vulkan/vk_scheduler.h
         renderer_vulkan/vk_resource_pool.cpp
         renderer_vulkan/vk_resource_pool.h
+        renderer_vulkan/vk_gpu_error.cpp
+        renderer_vulkan/vk_gpu_error.h
+        renderer_vulkan/vk_gpu_status.h
         renderer_vulkan/vk_instance.cpp
         renderer_vulkan/vk_instance.h
         renderer_vulkan/vk_pipeline_cache.cpp
