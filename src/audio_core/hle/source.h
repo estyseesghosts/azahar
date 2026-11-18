@@ -70,8 +70,10 @@ public:
 private:
     const std::size_t source_id;
     Memory::MemorySystem* memory_system{};
-    StereoFrame16 current_frame;
-    StereoFrame16 backup_frame; // TODO(PabloMK7): Check if we actually need this
+    // Value-initialized: both are serialized, and backup_frame is never written, so uninitialized
+    // heap bytes reached savestates and state_hash (lotus#42).
+    StereoFrame16 current_frame{};
+    StereoFrame16 backup_frame{}; // TODO(PabloMK7): Check if we actually need this
 
     using Format = SourceConfiguration::Configuration::Format;
     using InterpolationMode = SourceConfiguration::Configuration::InterpolationMode;
