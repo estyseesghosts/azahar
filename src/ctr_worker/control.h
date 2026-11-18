@@ -139,7 +139,20 @@ private:
                 {"audio_focused", AudioCore::WorkerSink::focused},
                 {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered},
                 {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"},
-                {"transport", writer.Stats()}, {"gpu_memory", GpuMemory()}};
+                {"transport", writer.Stats()}, {"gpu_memory", GpuMemory()},
+                {"features", Features()}};
+    }
+    /// Optional control features this build implements (lotus#42). The host refuses a request
+    /// that needs a feature missing here instead of sending it to a worker that would ignore
+    /// it. Names are lotus_protocol::capabilities::feature constants.
+    static Json Features() {
+        Json features = Json::array({"flush_storage", "deterministic_async"});
+        if (PreviewRing::Supported())
+            features.push_back("preview_nonblocking");
+#ifdef ENABLE_VULKAN
+        features.push_back("gpu_memory");
+#endif
+        return features;
     }
     /// VMA heap budgets and this process's device-memory blocks (lotus#46); null without a
     /// Vulkan renderer.
