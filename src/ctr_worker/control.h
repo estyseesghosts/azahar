@@ -172,7 +172,7 @@ private:
     /// that needs a feature missing here instead of sending it to a worker that would ignore
     /// it. Names are lotus_protocol::capabilities::feature constants.
     static Json Features() {
-        Json features = Json::array({"flush_storage", "event_subscriptions", "gpu_capture_levels", "state_hash", "deterministic_async"});
+        Json features = Json::array({"flush_storage", "event_subscriptions", "gpu_capture_levels", "state_hash", "deterministic_async", "analog_input"});
         if (PreviewRing::Supported())
             features.push_back("preview_nonblocking");
 #ifdef ENABLE_VULKAN
@@ -504,12 +504,22 @@ private:
                 const auto buttons = static_cast<u32>(
                     Unsigned(params, "buttons", (1u << Settings::NativeButton::NumButtons) - 1));
                 const auto x = Unsigned(params, "x", 319), y = Unsigned(params, "y", 239);
-                if (buttons >= (1u << Settings::NativeButton::NumButtons) || x >= 320 || y >= 240) {
+                const auto circle = Stick(params, "circle_pad", input.circle),
+                           cstick = Stick(params, "c_stick", input.cstick);
+                if (buttons >= (1u << Settings::NativeButton::NumButtons) || x >= 320 || y >= 240 ||
+                    !circle || !cstick) {
                     Reply(request, "invalid_argument");
                     return;
                 }
                 owner = requested_owner;
-                input = {buttons, x / 320.0f, y / 240.0f, params.value("touch", false)};
+                // Only the sent fields change (lotus#60): a button/touch update no longer zeroes
+                // the sticks, and motion/slider state set by input_state is kept.
+                input.buttons = buttons;
+                input.x = x / 320.0f;
+                input.y = y / 240.0f;
+                input.touch = params.value("touch", false);
+                input.circle = *circle;
+                input.cstick = *cstick;
                 debug.ForceCheckpoint();
                 Reply(request, "ok", Snapshot());
             } else if (method == "registers") {
@@ -563,6 +573,21 @@ private:
 #endif
             Reply(request, "unsupported", {{"reason", error.what()}});
         }
+    }
+    /// Optional analog stick `[x, y]`, each finite in -1..1 (the range input_state accepts,
+    /// ctr_worker/input.h ApplyInput); absent keeps `current`, malformed is nullopt.
+    static std::optional<std::array<float, 2>> Stick(const Json& params, const char* key,
+                                                     std::array<float, 2> current) {
+        if (!params.contains(key))
+            return current;
+        const auto& value = params.at(key);
+        if (!value.is_array() || value.size() != 2 || !value[0].is_number() || !value[1].is_number())
+            return std::nullopt;
+        const std::array<float, 2> stick{value[0].get<float>(), value[1].get<float>()};
+        for (const float axis : stick)
+            if (!std::isfinite(axis) || std::abs(axis) > 1.0f)
+                return std::nullopt;
+        return stick;
     }
     static u64 Unsigned(const Json& params, const char* key, u64 maximum) {
         if (!params.contains(key) || !params.at(key).is_number_unsigned() ||
