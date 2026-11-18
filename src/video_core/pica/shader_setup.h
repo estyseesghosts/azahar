@@ -18,9 +18,12 @@ using ProgramCode = std::array<u32, MAX_PROGRAM_CODE_LENGTH>;
 using SwizzleData = std::array<u32, MAX_SWIZZLE_DATA_LENGTH>;
 
 struct Uniforms {
-    alignas(16) std::array<Common::Vec4<f24>, 96> f;
-    std::array<bool, 16> b;
-    std::array<Common::Vec4<u8>, 4> i;
+    // Value-initialized: all three are serialized whether or not the guest wrote them, and f24
+    // and Vec4 have no default initializers, so uninitialized heap bytes reached savestates and
+    // state_hash (lotus#42).
+    alignas(16) std::array<Common::Vec4<f24>, 96> f{};
+    std::array<bool, 16> b{};
+    std::array<Common::Vec4<u8>, 4> i{};
 
     static std::size_t GetFloatUniformOffset(u32 index) {
         return offsetof(Uniforms, f) + index * sizeof(Common::Vec4<f24>);
