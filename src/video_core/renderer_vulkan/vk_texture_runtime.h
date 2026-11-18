@@ -207,10 +207,10 @@ public:
 
     /// Returns the image view at index, otherwise the base view
     vk::ImageView ImageView(ViewType view_type = ViewType::Sample,
-                            Type type = Type::Current) noexcept;
+                            Type type = Type::Current);
 
     /// Returns a framebuffer handle for rendering to this surface
-    vk::Framebuffer Framebuffer(Type type = Type::Current) noexcept;
+    vk::Framebuffer Framebuffer(Type type = Type::Current);
 
     /// Returns width of the surface
     u32 GetWidth() const noexcept {
@@ -228,26 +228,26 @@ public:
     }
 
     /// Returns a copy of the upscaled image handle, used for feedback loops.
-    vk::ImageView CopyImageView() noexcept;
+    vk::ImageView CopyImageView();
 
     /// Returns the framebuffer view of the surface image
-    vk::ImageView FramebufferView() noexcept {
+    vk::ImageView FramebufferView() {
         is_framebuffer = true;
         return ImageView(ViewType::Mip0);
     }
 
     /// Returns the depth view of the surface image
-    vk::ImageView DepthView() noexcept {
+    vk::ImageView DepthView() {
         return ImageView(ViewType::Depth);
     }
 
     /// Returns the stencil view of the surface image
-    vk::ImageView StencilView() noexcept {
+    vk::ImageView StencilView() {
         return ImageView(ViewType::Stencil);
     }
 
     /// Returns the R32 image view used for atomic load/store.
-    vk::ImageView StorageView() noexcept {
+    vk::ImageView StorageView() {
         is_storage = true;
         return ImageView(ViewType::Storage);
     }

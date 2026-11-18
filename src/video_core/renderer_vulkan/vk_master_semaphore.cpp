@@ -3,12 +3,16 @@
 
 #include <limits>
 #include <mutex>
+#include "video_core/renderer_vulkan/vk_gpu_error.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
 namespace Vulkan {
 
 constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
+/// Waits re-check the renderer fault latch this often: a tick whose submission was dropped
+/// after a fault is never signalled (lotus#46).
+constexpr u64 FAULT_POLL_NS = 100'000'000;
 
 MasterSemaphoreTimeline::MasterSemaphoreTimeline(const Instance& instance_) : instance{instance_} {
     const vk::StructureChain semaphore_chain = {
@@ -54,8 +58,12 @@ void MasterSemaphoreTimeline::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphoresKHR(&wait_info, WAIT_TIMEOUT) !=
+    while (instance.GetDevice().waitSemaphoresKHR(&wait_info, FAULT_POLL_NS) !=
            vk::Result::eSuccess) {
+        ThrowIfFaulted();
+        if (Faulted()) {
+            return; // acknowledged: the worker is shutting the renderer down
+        }
     }
     Refresh();
 }
@@ -98,7 +106,7 @@ void MasterSemaphoreTimeline::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore
     try {
         instance.GetGraphicsQueue().submit(submit_info);
     } catch (vk::DeviceLostError& err) {
-        UNREACHABLE_MSG("Device lost during submit: {}", err.what());
+        ThrowGpuError(VK_ERROR_DEVICE_LOST, std::string{"queue submit: "} + err.what());
     }
 }
 
@@ -121,7 +129,16 @@ void MasterSemaphoreFence::Refresh() {}
 
 void MasterSemaphoreFence::Wait(u64 tick) {
     std::unique_lock lk{free_mutex};
-    free_cv.wait(lk, [&] { return gpu_tick.load(std::memory_order_relaxed) >= tick; });
+    while (!free_cv.wait_for(lk, std::chrono::nanoseconds{FAULT_POLL_NS}, [&] {
+        return gpu_tick.load(std::memory_order_relaxed) >= tick;
+    })) {
+        lk.unlock();
+        ThrowIfFaulted();
+        if (Faulted()) {
+            return;
+        }
+        lk.lock();
+    }
 }
 
 void MasterSemaphoreFence::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore wait,
@@ -150,7 +167,7 @@ void MasterSemaphoreFence::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore wa
     try {
         instance.GetGraphicsQueue().submit(submit_info, fence);
     } catch (vk::DeviceLostError& err) {
-        UNREACHABLE_MSG("Device lost during submit: {}", err.what());
+        ThrowGpuError(VK_ERROR_DEVICE_LOST, std::string{"queue submit: "} + err.what());
     }
 
     std::scoped_lock lock{wait_mutex};
@@ -175,7 +192,9 @@ void MasterSemaphoreFence::WaitThread(std::stop_token token) {
 
         const vk::Result result = device.waitForFences(fence, true, WAIT_TIMEOUT);
         if (result != vk::Result::eSuccess) {
-            UNREACHABLE_MSG("Fence wait failed with error {}", vk::to_string(result));
+            const auto code = static_cast<VkResult>(result);
+            RaiseFault(GpuError{KindOf(code), code, "fence wait"});
+            return;
         }
 
         device.resetFences(fence);

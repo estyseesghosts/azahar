@@ -14,6 +14,9 @@
 #include "ctr_worker/frontend.h"
 #include "ctr_worker/input.h"
 #include "ctr_worker/transport.h"
+#ifdef ENABLE_VULKAN
+#include "video_core/renderer_vulkan/vk_gpu_status.h"
+#endif
 
 namespace CtrWorker {
 using Json = nlohmann::json;
@@ -42,6 +45,13 @@ public:
         };
         Settings::values.output_type = AudioCore::SinkType::Worker;
         Frontend::control_callback = [this] { Drain(true); };
+#ifdef ENABLE_VULKAN
+        active = this;
+        main_thread = std::this_thread::get_id();
+        Vulkan::SetGpuFailureHandler([](const Vulkan::GpuFailure& failure) {
+            active->ExitOnGpuFailure(failure);
+        });
+#endif
         std::thread reader{[this] {
             stdin_reader.Enter();
             while (!stopping) {
@@ -101,8 +111,17 @@ public:
                 }
             }
         } catch (const std::exception& error) {
-            std::cerr << "worker_control_error: " << error.what() << '\n';
-            exit_code = 1;
+#ifdef ENABLE_VULKAN
+            if (const auto gpu = Vulkan::DescribeGpuFailure(error)) {
+                ReportGpuFailure(*gpu);
+                device_lost = gpu->device_lost;
+                exit_code = GPU_FAILURE_EXIT;
+            } else
+#endif
+            {
+                std::cerr << "worker_control_error: " << error.what() << '\n';
+                exit_code = 1;
+            }
         }
         if (writer.Failed())
             exit_code = 1;
@@ -111,8 +130,25 @@ public:
         reader.join();
         Frontend::control_callback = {};
         debug.Detach();
-        if (system.IsPoweredOn())
-            system.Shutdown();
+        // After an allocation failure the renderer is shut down normally, which releases its
+        // VMA allocations. After device loss Vulkan teardown can itself fail; the process exits
+        // without it and the driver reclaims the device's memory (lotus#46).
+        if (device_lost) {
+            writer.Close();
+            Common::Log::Stop();
+            std::fflush(nullptr);
+            std::_Exit(exit_code);
+        }
+        try {
+            if (system.IsPoweredOn())
+                system.Shutdown();
+        } catch (const std::exception& error) {
+            std::cerr << "worker_shutdown_error: " << error.what() << '\n';
+            writer.Close();
+            Common::Log::Stop();
+            std::fflush(nullptr);
+            std::_Exit(exit_code ? exit_code : 1);
+        }
         AudioCore::WorkerSink::CaptureStop();
         writer.Close();
         Common::Log::Stop();
@@ -129,8 +165,65 @@ private:
                 {"audio_focused", AudioCore::WorkerSink::focused},
                 {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered},
                 {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"},
-                {"transport", writer.Stats()}};
+                {"transport", writer.Stats()}, {"gpu_memory", GpuMemory()}};
     }
+    /// VMA heap budgets and this process's device-memory blocks (lotus#46); null without a
+    /// Vulkan renderer.
+    static Json GpuMemory() {
+#ifdef ENABLE_VULKAN
+        const auto stats = Vulkan::QueryGpuMemory();
+        if (!stats.available)
+            return nullptr;
+        Json heaps = Json::array();
+        for (const auto& heap : stats.heaps)
+            heaps.push_back({{"device_local", heap.device_local},
+                             {"size", heap.size},
+                             {"budget", heap.budget},
+                             {"usage", heap.usage},
+                             {"block_bytes", heap.block_bytes},
+                             {"block_bytes_high_water", heap.block_bytes_high_water},
+                             {"allocation_bytes", heap.allocation_bytes}});
+        return {{"budget_source", stats.budget_extension ? "VK_EXT_memory_budget"
+                                                         : "vma_estimate"},
+                {"allocation_failures", stats.allocation_failures},
+                {"heaps", std::move(heaps)}};
+#else
+        return nullptr;
+#endif
+    }
+#ifdef ENABLE_VULKAN
+    /// One stderr line the host classifies (lotus failure.rs), plus the frame and budgets.
+    /// The frame counter is the emulation thread's; it is left out on renderer threads.
+    void ReportGpuFailure(const Vulkan::GpuFailure& error) {
+        Vulkan::AcknowledgeFault();
+        Json report{{"cause", error.cause},
+                    {"vk_result", error.vk_result},
+                    {"vk_result_name", error.vk_result_name},
+                    {"object", error.object},
+                    {"gpu_memory", GpuMemory()}};
+        if (std::this_thread::get_id() == main_thread)
+            report["frame"] = window.frames;
+        std::cerr << "worker_gpu_error: " << report.dump() << std::endl;
+        LOG_CRITICAL(Render_Vulkan, "worker_gpu_error: {}", report.dump());
+    }
+    /// The failure handler (lotus#46): report, flush the log, end this session's process. The
+    /// failure may be inside JIT code or on a renderer thread, where nothing can be unwound or
+    /// shut down safely; process exit releases the device memory. The host sees the pipe close,
+    /// reads the report from the stderr and log tails, and keeps every other session running.
+    void ExitOnGpuFailure(const Vulkan::GpuFailure& error) {
+        static std::atomic_bool exiting = false;
+        if (exiting.exchange(true)) {
+            for (;;)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        ReportGpuFailure(error);
+        Common::Log::Stop();
+        std::fflush(nullptr);
+        std::_Exit(GPU_FAILURE_EXIT);
+    }
+    static inline Control* active = nullptr;
+    static inline std::thread::id main_thread;
+#endif
     void Reply(const Json& request, const std::string& status, Json data = nullptr) {
         writer.Post({{"version_major", 1},
               {"version_minor", 0},
@@ -451,6 +544,10 @@ private:
         } catch (const std::filesystem::filesystem_error&) {
             Reply(request, "invalid_argument");
         } catch (const std::runtime_error& error) {
+#ifdef ENABLE_VULKAN
+            if (Vulkan::DescribeGpuFailure(error))
+                throw;
+#endif
             Reply(request, "unsupported", {{"reason", error.what()}});
         }
     }
@@ -468,8 +565,10 @@ private:
     std::string session, content, last_error, state = "idle", owner = "live";
     u64 epoch = 1, target = 0, capture_sequence = 0, last_request = 0;
     PreviewRing preview;
-    bool unsupported = false;
+    bool unsupported = false, device_lost = false;
     int exit_code = 0;
+    /// Exit code after a typed GPU failure, distinct from 1 (protocol or control error).
+    static constexpr int GPU_FAILURE_EXIT = 4;
     std::chrono::steady_clock::time_point deadline;
     std::optional<Json> pending_run;
     std::mutex mutex;

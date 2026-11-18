@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
+#include "video_core/renderer_vulkan/vk_gpu_error.h"
 
 namespace Vulkan {
 
@@ -166,6 +167,7 @@ Instance::Instance(Frontend::EmuWindow& window, u32 physical_device_index)
 }
 
 Instance::~Instance() {
+    UnregisterAllocator();
     vmaDestroyAllocator(allocator);
 }
 
@@ -420,7 +422,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 16> enabled_extensions;
+    boost::container::static_vector<const char*, 24> enabled_extensions;
     const auto add_extension = [&](std::string_view extension, bool blacklist = false,
                                    std::string_view reason = "") -> bool {
         const auto result =
@@ -448,6 +450,9 @@ bool Instance::CreateDevice() {
     const bool is_turnip = driver_id == vk::DriverIdKHR::eMesaTurnip;
 
     add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    // Heap budgets that include other processes (lotus#46); Vulkan 1.1 core covers its
+    // VK_KHR_get_physical_device_properties2 dependency (TargetVulkanApiVersion).
+    memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     image_format_list = add_extension(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
     create_renderpass2 = add_extension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
     depth_stencil_resolve = add_extension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
@@ -669,8 +674,10 @@ void Instance::CreateAllocator() {
     };
 
     const VmaAllocatorCreateInfo allocator_info = {
+        .flags = memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0u,
         .physicalDevice = physical_device,
         .device = GetDevice(),
+        .pDeviceMemoryCallbacks = MemoryCallbacks(),
         .pVulkanFunctions = &functions,
         .instance = GetInstance(),
         .vulkanApiVersion = TargetVulkanApiVersion,
@@ -678,8 +685,9 @@ void Instance::CreateAllocator() {
 
     const VkResult result = vmaCreateAllocator(&allocator_info, &allocator);
     if (result != VK_SUCCESS) {
-        UNREACHABLE_MSG("Failed to initialize VMA with error {}", result);
+        ThrowGpuError(result, "VMA allocator");
     }
+    RegisterAllocator(allocator, memory_budget);
 }
 
 void Instance::CollectToolingInfo() {
