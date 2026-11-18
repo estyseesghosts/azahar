@@ -104,12 +104,15 @@ public:
             u8 vertex_id : 2;
         };
         u8 raw;
-    } emit_state;
+    } emit_state{};
     static_assert(sizeof(emit_state) == 1);
 
-    u32 output_mask;
-    std::array<AttributeBuffer, 3> buffer;
-    Handlers* handlers;
+    // Value-initialized: all three are serialized (and `buffer` read by Emit) whether or not the
+    // guest ever ran a geometry shader, so uninitialized heap bytes reached savestates and
+    // state_hash (lotus#42).
+    u32 output_mask{};
+    std::array<AttributeBuffer, 3> buffer{};
+    Handlers* handlers{};
 
 private:
     friend class boost::serialization::access;
