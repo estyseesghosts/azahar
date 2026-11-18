@@ -1,7 +1,7 @@
 # CITnLO 
 ### CITra n LOtus 
 
-a fork of the azahar (citra) emulator, intended for writing and debugging 3DS homebrew. CITnLO is the emulator backend powering Lotus. 
+a fork of the azahar (citra) emulator, intended for writing and debugging 3DS homebrew. CITnLO is the emulator backend powering [Lotus](https://github.com/estyseesghosts/lotus). 
 
 CITnLO is the `experimental` branch of this fork. `integration` (AZAHAR in Lotus) carries only the native worker hooks and frame, audio and input adapters; CITnLO adds the debugger on top. Lotus pins both branches in [`config/pins.toml`](https://github.com/estyseesghosts/lotus/blob/main/config/pins.toml). Branch rules: [03](https://github.com/estyseesghosts/lotus/blob/main/docs/03-azahar-branches.md).
 
