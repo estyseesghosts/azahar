@@ -418,9 +418,19 @@ public:
     /// level decompresses to the same serialized bytes.
     std::vector<u8> SaveStateBuffer(int compression_level, SaveStateTiming* timing) const;
 
+    /// SaveStateBuffer() in two steps (lotus#32). SerializeState reads emulated state and must
+    /// run at a safe point on the emulation thread. CompressState reads only its arguments, so
+    /// it may run on another thread; its result equals SaveStateBuffer() for the same state.
+    void SerializeState(std::vector<u8>& out) const;
+    std::array<u8, 256> StateHeader() const;
+    static std::vector<u8> CompressState(std::span<const u8> header,
+                                         std::span<const u8> serialized, int compression_level);
+
     bool LoadStateBuffer(std::vector<u8> buffer);
     /// As above without copying the caller's buffer.
     bool LoadStateBuffer(std::span<const u8> buffer);
+    /// Loads SerializeState() output from this process: no header and no compression.
+    bool LoadStateSerialized(std::span<const u8> serialized);
 
     /// Serializes as SaveStateBuffer() does, without header or compression, and records the
     /// byte offset at the end of each top-level section of serialize() in `marks`, so callers

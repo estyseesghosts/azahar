@@ -292,19 +292,19 @@ std::vector<u8> System::SaveStateBuffer() const {
     return SaveStateBuffer(Common::Compression::DefaultCompressionLevel(), nullptr);
 }
 
-std::vector<u8> System::SaveStateBuffer(int compression_level, SaveStateTiming* timing) const {
-    const auto serialize_start = std::chrono::steady_clock::now();
-    std::vector<u8> serialized;
-    serialized.reserve(last_serialized_size.load(std::memory_order_relaxed));
+void System::SerializeState(std::vector<u8>& out) const {
+    out.clear();
+    out.reserve(last_serialized_size.load(std::memory_order_relaxed));
     {
-        VectorWriteBuffer buffer{serialized};
+        VectorWriteBuffer buffer{out};
         std::ostream stream{&buffer};
         oarchive oa{stream};
         oa&* this;
     }
-    last_serialized_size.store(serialized.size(), std::memory_order_relaxed);
-    const u64 serialize_ns = Nanoseconds(serialize_start);
+    last_serialized_size.store(out.size(), std::memory_order_relaxed);
+}
 
+std::array<u8, 256> System::StateHeader() const {
     CSTHeader header{};
     header.filetype = header_magic_bytes;
     header.program_id = title_id;
@@ -325,10 +325,25 @@ std::vector<u8> System::SaveStateBuffer(int compression_level, SaveStateTiming* 
     std::memcpy(header.build_version.data(), build_version.c_str(),
                 std::min(build_version.length(), sizeof(header.build_version) - 1));
 
+    std::array<u8, 256> bytes;
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    return bytes;
+}
+
+std::vector<u8> System::CompressState(std::span<const u8> header, std::span<const u8> serialized,
+                                      int compression_level) {
+    return Common::Compression::CompressDataZSTDAfter(header, serialized, compression_level);
+}
+
+std::vector<u8> System::SaveStateBuffer(int compression_level, SaveStateTiming* timing) const {
+    const auto serialize_start = std::chrono::steady_clock::now();
+    std::vector<u8> serialized;
+    SerializeState(serialized);
+    const u64 serialize_ns = Nanoseconds(serialize_start);
+
+    const auto header = StateHeader();
     const auto compress_start = std::chrono::steady_clock::now();
-    auto result = Common::Compression::CompressDataZSTDAfter(
-        std::span<const u8>{reinterpret_cast<const u8*>(&header), sizeof(header)}, serialized,
-        compression_level);
+    auto result = CompressState(header, serialized, compression_level);
     if (timing) {
         *timing = {serialize_ns, Nanoseconds(compress_start), serialized.size()};
     }
@@ -387,7 +402,11 @@ bool System::LoadStateBuffer(std::span<const u8> buffer) {
 
     const auto decompressed =
         Common::Compression::DecompressDataZSTD(buffer.subspan(sizeof(CSTHeader)));
-    SpanReadBuffer source{decompressed};
+    return LoadStateSerialized(decompressed);
+}
+
+bool System::LoadStateSerialized(std::span<const u8> serialized) {
+    SpanReadBuffer source{serialized};
     std::istream stream{&source};
 
     // Deserialize

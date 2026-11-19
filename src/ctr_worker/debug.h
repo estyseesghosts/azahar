@@ -39,6 +39,7 @@
 #include "core/frontend/debug_channel.h"
 #include "ctr_worker/debug_gpu.h"
 #include "ctr_worker/debug_citrace.h"
+#include "ctr_worker/checkpoint.h"
 
 namespace CtrWorker {
 inline void DefaultProfile() {
@@ -59,6 +60,7 @@ inline void DefaultProfile() {
     Settings::values.deterministic_async_operations = true;
 }
 class DebugTools {
+    struct HistoryEntry; // defined with the history members; named by Restore()
 public:
     using Json = nlohmann::json;
     explicit DebugTools(Core::System& system, const std::filesystem::path& root)
@@ -262,7 +264,7 @@ public:
         }
         breakpoints.clear();
         scan.clear();
-        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;hits_untracked=false;history_level=3;checkpoint_stats={};
+        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;hits_untracked=false;history_level=3;history_queue=1;checkpoint_stats={};lost={};
         replaying=false;position_at_hit=false;
         predicate=nullptr;predicate_mask=0;
         hio_pending = 0;
@@ -464,43 +466,106 @@ public:
     void Remember(u64 frame, const Json& input, std::optional<u32> core={}) {
         if(!rewind_enabled || (!core && !WantsFrameCheckpoint(frame)))return;
         if(!core)history_force=false;
-        if(system.Kernel().AreAsyncOperationsPending()){++history_lost;return;}
-        ArmWatches(false);std::vector<u8> bytes;
-        Core::System::SaveStateTiming timing;
-        try {bytes=system.SaveStateBuffer(history_level,&timing);}catch(...){ArmWatches(true);throw;}
-        ArmWatches(true);
-        ++checkpoint_stats.count;checkpoint_stats.serialize_ns+=timing.serialize_ns;
-        checkpoint_stats.compress_ns+=timing.compress_ns;checkpoint_stats.serialized_bytes+=timing.serialized_bytes;
-        checkpoint_stats.stored_bytes+=bytes.size();
-        if(bytes.size()>history_budget)throw std::invalid_argument("single snapshot exceeds rewind memory budget");
-        while(!history.empty() && (history.size()>=history_capacity || history_bytes+bytes.size()>history_budget)) {
-            history_bytes-=history.front().bytes.size();history.pop_front();++history_lost;
+        SettleHistory();
+        if(system.Kernel().AreAsyncOperationsPending()){++lost.async_operations;return;}
+        // Emulation-thread cost of this checkpoint: queue backpressure, serialization and,
+        // with compression_queue 0, compression (lotus#32).
+        const auto start=std::chrono::steady_clock::now();
+        auto checkpoint=std::make_shared<Checkpoint>();
+        checkpoint->level=history_level;
+        if(history_queue){
+            const u64 waited=compressor.WaitForSlot(history_queue);
+            if(waited){++checkpoint_stats.backlog_waits;checkpoint_stats.backlog_wait_ns+=waited;}
+            SettleHistory();
         }
-        history_bytes+=bytes.size();history_frame=frame;
+        ArmWatches(false);
+        const auto serialize_start=std::chrono::steady_clock::now();
+        try {system.SerializeState(checkpoint->serialized);}catch(...){ArmWatches(true);throw;}
+        ArmWatches(true);
+        checkpoint_stats.serialize_ns+=Since(serialize_start);
+        checkpoint->header=system.StateHeader();
+        checkpoint->serialized_bytes=checkpoint->serialized.size();
+        ++checkpoint_stats.count;checkpoint_stats.serialized_bytes+=checkpoint->serialized_bytes;
+        while(!history.empty() && history.size()>=history_capacity){DropOldest();++lost.capacity;}
         std::map<u64,u64> hits;
         for (const auto& [id, bp] : breakpoints) hits[id] = bp.hits;
-        history.push_back({std::move(bytes),frame,core,input,SettingsSnapshot(),Json::object(),0,std::move(hits),
+        history_frame=frame;
+        history.push_back({checkpoint,frame,core,input,SettingsSnapshot(),Json::object(),0,std::move(hits),
                            skip_core,skip_pc});
         hits_untracked=false;
+        if(history_queue)compressor.Submit(std::move(checkpoint));
+        else {checkpoint->Compress();++checkpoint_stats.inline_compressions;}
+        checkpoint_stats.sync_ns+=Since(start);
+        SettleHistory();
     }
-    bool Restore(const std::vector<u8>& bytes) {
+    static u64 Since(std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+    }
+    void DropOldest() {
+        history_bytes-=history.front().stored;history.pop_front();
+    }
+    void DropNewest() {
+        history_bytes-=history.back().stored;history.pop_back();
+    }
+    // Accounts checkpoints whose compression finished, then applies the memory budget to the
+    // stored (compressed) bytes, oldest first. Pending checkpoints are reported separately and
+    // bounded by compression_queue. Emulation thread only.
+    void SettleHistory() {
+        for(auto& entry:history){
+            if(entry.settled || !entry.state->done.load(std::memory_order_acquire))continue;
+            entry.settled=true;entry.stored=entry.state->StoredBytes();history_bytes+=entry.stored;
+            checkpoint_stats.compress_ns+=entry.state->compress_ns;checkpoint_stats.stored_bytes+=entry.stored;
+            if(entry.state->failed)++checkpoint_stats.compress_failures;
+        }
+        // A checkpoint larger than the whole budget cannot be kept (the synchronous path
+        // refused it); it is dropped and counted instead of evicting everything else.
+        for(size_t i=0;i<history.size();){
+            if(history[i].settled && history[i].stored>history_budget){
+                history_bytes-=history[i].stored;history.erase(history.begin()+i);++lost.oversize;
+            } else ++i;
+        }
+        while(history_bytes>history_budget && !history.empty()){DropOldest();++lost.budget;}
+    }
+    bool Restore(const HistoryEntry& entry) {
         const auto start=std::chrono::steady_clock::now();
-        const bool ok=system.LoadStateBuffer(std::span<const u8>{bytes});
-        ++checkpoint_stats.restores;
-        checkpoint_stats.restore_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+        bool serialized=false;
+        const bool ok=entry.state->Restore(system,serialized);
+        ++checkpoint_stats.restores;checkpoint_stats.restores_serialized+=serialized;
+        checkpoint_stats.restore_ns+=Since(start);
         return ok;
     }
     void MarkHistoryStop() { if(rewind_enabled && stopped && !history.empty())history.back().stop=stop_reason; }
-    Json HistoryStatus() const {
+    Json HistoryStatus() {
+        SettleHistory();
+        const auto load=compressor.Current();
         return {{"enabled",rewind_enabled},{"interval_frames",history_interval},{"snapshots",history.size()},{"bytes",history_bytes},
-            {"capacity",history_capacity},{"budget_bytes",history_budget},{"lost_snapshots",history_lost},
+            {"capacity",history_capacity},{"budget_bytes",history_budget},
+            {"lost_snapshots",lost.capacity+lost.budget+lost.async_operations+lost.oversize},
+            // Why checkpoints were lost: evicted for capacity or the memory budget, not taken
+            // while guest async operations were pending, or larger than the whole budget.
+            {"lost",{{"capacity",lost.capacity},{"budget",lost.budget},{"async_operations",lost.async_operations},
+                     {"oversize",lost.oversize}}},
             {"compression_level",history_level},
+            // lotus#32: checkpoints waiting for or in compression on the worker's compression
+            // thread and their serialized bytes, bounded by compression_queue.
+            {"compression_queue",history_queue},{"compression_pending",load.pending},
+            {"compression_pending_bytes",load.pending_bytes},{"compression_pending_peak_bytes",load.peak_pending_bytes},
             // Host nanoseconds since rewind_configure: checkpoint phases and restores.
+            // checkpoint_sync_ns is all time spent on the emulation thread, including backlog
+            // waits and, with compression_queue 0, compression. checkpoint_compress_ns counts
+            // compression wherever it ran, for settled checkpoints.
             {"checkpoints",checkpoint_stats.count},{"checkpoint_serialize_ns",checkpoint_stats.serialize_ns},
             {"checkpoint_compress_ns",checkpoint_stats.compress_ns},
+            {"checkpoint_sync_ns",checkpoint_stats.sync_ns},
+            {"checkpoint_backlog_waits",checkpoint_stats.backlog_waits},
+            {"checkpoint_backlog_wait_ns",checkpoint_stats.backlog_wait_ns},
+            {"checkpoint_inline_compressions",checkpoint_stats.inline_compressions},
+            {"checkpoint_compress_failures",checkpoint_stats.compress_failures},
             {"checkpoint_serialized_bytes",checkpoint_stats.serialized_bytes},
             {"checkpoint_stored_bytes",checkpoint_stats.stored_bytes},
             {"restores",checkpoint_stats.restores},{"restore_ns",checkpoint_stats.restore_ns},
+            // Restores of a checkpoint still uncompressed: loaded without decompression.
+            {"restores_serialized",checkpoint_stats.restores_serialized},
             {"instruction_history","explicit step operations; continuous execution records frame safe points"},
             {"reverse_continue","replays from frame or instruction checkpoints with instruction stepping; lands before the previous breakpoint or watchpoint access"}};
     }
@@ -517,7 +582,7 @@ public:
         if(!core && entry.stop.empty())throw std::invalid_argument("no recorded debugger stop in rewind history");
         if(entry.settings!=SettingsSnapshot())throw std::invalid_argument("rewind profile changed");
         const bool trace=trace_svc;SetTrace(false);ArmWatches(false);
-        if(!Restore(entry.bytes))throw std::runtime_error("rewind restore failed");
+        if(!Restore(entry))throw std::runtime_error("rewind restore failed");
         ArmWatches(true);if(trace)SetTrace(true);
         for(u32 i=0;i<system.GetNumCores();++i){system.GetCore(i).ClearInstructionCache();system.GetCore(i).ClearBreakFlag();}
         stopped=false;skip_core=0xffffffff;
@@ -531,7 +596,7 @@ public:
             Stop(core?"step":original.value("reason",std::string{"manual"}).c_str(),stop);
             result["stop"]=StopReason();
         }
-        while(history.size()>index){history_bytes-=history.back().bytes.size();history.pop_back();}
+        while(history.size()>index)DropNewest();
         history_frame=~0ull;
         return result;
     }
@@ -573,7 +638,7 @@ public:
         const bool trace = trace_svc;
         SetTrace(false);
         ArmWatches(false);
-        if (!Restore(entry.bytes)) throw std::runtime_error("rewind restore failed");
+        if (!Restore(entry)) throw std::runtime_error("rewind restore failed");
         ArmWatches(true);
         if (trace) SetTrace(true);
         for (u32 i = 0; i < system.GetNumCores(); ++i) {
@@ -648,7 +713,7 @@ public:
         ArmWatches(false);
         std::vector<u8> present;
         try {
-            present = system.SaveStateBuffer();
+            system.SerializeState(present);
         } catch (...) {
             ArmWatches(true);
             throw;
@@ -664,7 +729,7 @@ public:
             const bool trace = trace_svc;
             SetTrace(false);
             ArmWatches(false);
-            system.LoadStateBuffer(present);
+            system.LoadStateSerialized(present);
             ArmWatches(true);
             if (trace) SetTrace(true);
             for (u32 i = 0; i < system.GetNumCores(); ++i) system.GetCore(i).ClearInstructionCache();
@@ -692,10 +757,7 @@ public:
                 throw std::runtime_error("reverse replay did not reach the watched access; present state restored");
             }
         }
-        while (history.size() > k + 1) {
-            history_bytes -= history.back().bytes.size();
-            history.pop_back();
-        }
+        while (history.size() > k + 1) DropNewest();
         // A watchpoint landing is before its access, which will be counted again going forward.
         history[k].window_hits = watch ? target - 1 : target;
         history_frame = ~0ull;
@@ -1297,9 +1359,13 @@ public:
                 // zstd level of rewind checkpoints only; every level restores the same state.
                 const auto level=p.value("compression_level",3);
                 if(level<-7||level>19)throw std::invalid_argument("rewind compression_level -7..19");
+                // Checkpoints compressed off the emulation thread at once (lotus#32); 0
+                // compresses each one on the emulation thread.
+                const auto queue=p.value("compression_queue",1u);
+                if(queue>4)throw std::invalid_argument("rewind compression_queue 0..4");
                 rewind_enabled=p.at("enabled");history_capacity=capacity;history_budget=u64(budget)<<20;
-                history_interval=interval;history_force=false;history_level=level;checkpoint_stats={};
-                history.clear();history_bytes=history_lost=0;history_frame=~0ull;return HistoryStatus();
+                history_interval=interval;history_force=false;history_level=level;history_queue=queue;checkpoint_stats={};
+                history.clear();history_bytes=0;lost={};history_frame=~0ull;compressor.ResetPeak();return HistoryStatus();
             }
             if(op=="reverse_step")return Reverse(p.at("core").get<u32>());
             if(op=="reverse_continue")return ReverseContinue();
@@ -1661,21 +1727,27 @@ private:
     }
     struct Candidate { u32 address; u64 value; };
     struct HistoryEntry {
-        std::vector<u8> bytes;u64 frame;std::optional<u32> core;Json input,settings,stop;
+        std::shared_ptr<Checkpoint> state;u64 frame;std::optional<u32> core;Json input,settings,stop;
         u64 window_hits=0;            // breakpoint/watchpoint stops observed after this checkpoint
         std::map<u64,u64> bp_hits;    // breakpoint hit counters at this checkpoint
         u32 skip_core=0xffffffff, skip_pc=0; // resume-from-breakpoint skip in effect at this checkpoint
+        bool settled=false;           // compression finished and `stored` is in history_bytes
+        u64 stored=0;
     };
     bool hits_untracked=false;        // breakpoint set changed since the newest checkpoint
     bool replaying=false, position_at_hit=false;
     u64 replay_target=0, replay_hits=0, replay_instructions=0, replay_halt_instruction=~0ull, replay_hit_instruction=0;
     Json replay_hit;
     std::deque<HistoryEntry> history;
+    CheckpointCompressor compressor; // lotus#32; skips checkpoints the history has dropped
     bool rewind_enabled=false;
     size_t history_capacity=32;
-    u64 history_bytes=0,history_budget=64u<<20,history_lost=0,history_frame=~0ull,history_interval=1;
+    u64 history_bytes=0,history_budget=64u<<20,history_frame=~0ull,history_interval=1;
     int history_level=3; // ZSTD_CLEVEL_DEFAULT, what SaveStateBuffer() uses
-    struct {u64 count=0,serialize_ns=0,compress_ns=0,serialized_bytes=0,stored_bytes=0,restores=0,restore_ns=0;} checkpoint_stats;
+    u32 history_queue=1;
+    struct {u64 count=0,serialize_ns=0,compress_ns=0,sync_ns=0,backlog_waits=0,backlog_wait_ns=0,inline_compressions=0,
+            compress_failures=0,serialized_bytes=0,stored_bytes=0,restores=0,restores_serialized=0,restore_ns=0;} checkpoint_stats;
+    struct {u64 capacity=0,budget=0,async_operations=0,oversize=0;} lost;
     bool history_force=false;
     std::vector<Candidate> scan;
     u32 scan_width = 0;
