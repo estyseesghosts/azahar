@@ -305,13 +305,28 @@ GpuMemoryStats QueryGpuMemory() {
     vmaGetMemoryProperties(accounts.allocator, &properties);
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
     vmaGetHeapBudgets(accounts.allocator, budgets.data());
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT live_budget{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT,
+    };
+    if (stats.budget_extension) {
+        // VMA caches the extension values until an allocator refresh. An idle or
+        // allocation-free worker still needs to see changes made by other processes.
+        VmaAllocatorInfo info{};
+        vmaGetAllocatorInfo(accounts.allocator, &info);
+        VkPhysicalDeviceMemoryProperties2 memory{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+            .pNext = &live_budget,
+        };
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties2(info.physicalDevice,
+                                                                           &memory);
+    }
     for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
         stats.heaps.push_back({
             .device_local =
                 (properties->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0,
             .size = properties->memoryHeaps[heap].size,
-            .budget = budgets[heap].budget,
-            .usage = budgets[heap].usage,
+            .budget = stats.budget_extension ? live_budget.heapBudget[heap] : budgets[heap].budget,
+            .usage = stats.budget_extension ? live_budget.heapUsage[heap] : budgets[heap].usage,
             .block_bytes = accounts.live[heap].load(std::memory_order_relaxed),
             .block_bytes_high_water = accounts.high_water[heap].load(std::memory_order_relaxed),
             .allocation_bytes = budgets[heap].statistics.allocationBytes,
