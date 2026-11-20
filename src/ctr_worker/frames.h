@@ -144,7 +144,7 @@ public:
 #endif
     }
 
-    nlohmann::json Write(Core::System& system, u64 epoch, u64 frames, bool running) {
+    nlohmann::json Write(Core::System& system, u64 epoch, u64 frames, bool nonblocking) {
         Open();
         ++requests;
         const u64 sequence = this->sequence + 1;
@@ -162,7 +162,7 @@ public:
             shown = system.GPU().Renderer().PreviewScreens(
                 {base + FRAME_HEADER, base + TOP + FRAME_HEADER},
                 {ScreenLayout(SCREENS[0], 1), ScreenLayout(SCREENS[1], 1)}, id, epoch << FRAME_BITS,
-                !running);
+                !nonblocking);
         }
         if (!shown) {
             ++reused;

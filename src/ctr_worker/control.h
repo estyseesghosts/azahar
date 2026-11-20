@@ -423,7 +423,9 @@ private:
                     Reply(request, "not_ready");
                     return;
                 }
-                Reply(request, "ok", preview.Write(system, epoch, window.frames, state == "running"));
+                const bool nonblocking = state == "running" ||
+                                         (params.is_object() && params.value("nonblocking", false));
+                Reply(request, "ok", preview.Write(system, epoch, window.frames, nonblocking));
             } else if (method == "input") {
                 const auto requested_owner = params.at("owner").get<std::string>();
                 if (requested_owner != "live" && requested_owner != "scenario") {
