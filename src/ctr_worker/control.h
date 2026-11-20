@@ -172,7 +172,8 @@ private:
     /// that needs a feature missing here instead of sending it to a worker that would ignore
     /// it. Names are lotus_protocol::capabilities::feature constants.
     static Json Features() {
-        Json features = Json::array({"flush_storage", "event_subscriptions", "gpu_capture_levels", "state_hash", "deterministic_async", "analog_input"});
+        Json features = Json::array({"flush_storage", "event_subscriptions", "gpu_capture_levels",
+                                    "state_hash", "deterministic_async", "analog_input", "rewind_compression_queue"});
         if (PreviewRing::Supported())
             features.push_back("preview_nonblocking");
 #ifdef ENABLE_VULKAN
