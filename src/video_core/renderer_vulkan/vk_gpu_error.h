@@ -24,9 +24,9 @@
 // wait or flush. The worker's control loop catches GpuError, reports it and stops the session.
 //
 // Allocation accounting: VMA device-memory callbacks track this process's live block bytes and
-// their high-water mark per heap; budgets come from vmaGetHeapBudgets, which reflects other
-// processes only when VK_EXT_memory_budget is enabled (`budget_extension`). Without it VMA
-// estimates the budget as 80 % of the heap size and usage from this process alone.
+// their high-water mark per heap. Status queries VK_EXT_memory_budget directly when available
+// (`budget_extension`). Without it VMA estimates the budget as 80 % of the heap size and
+// usage from this process alone.
 //
 // Fault injection, for tests: CTR_WORKER_VK_FAIL_ALLOC=N makes the Nth image or buffer
 // allocation made through CreateImage/CreateBuffer (1-based, counted from process start) fail

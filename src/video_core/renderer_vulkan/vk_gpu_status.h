@@ -44,7 +44,7 @@ void SetGpuFailureHandler(GpuFailureHandler handler);
 struct GpuMemoryHeap {
     bool device_local;
     u64 size;
-    /// vmaGetHeapBudgets: what this process may use, and its current usage.
+    /// What this process may use and its current usage, from Vulkan or the VMA estimate.
     u64 budget;
     u64 usage;
     /// Live VkDeviceMemory blocks of this process and their high-water mark.
