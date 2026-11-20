@@ -60,6 +60,8 @@ struct GpuMemoryStats {
     /// otherwise VMA estimates the budget as 80 % of the heap and usage from this process.
     bool budget_extension = false;
     u64 allocation_failures = 0;
+    /// WDDM dedicated usage across processes on a supported Windows adapter.
+    std::optional<u64> adapter_dedicated_usage_bytes;
     std::vector<GpuMemoryHeap> heaps;
 };
 
