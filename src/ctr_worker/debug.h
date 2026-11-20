@@ -264,7 +264,9 @@ public:
         }
         breakpoints.clear();
         scan.clear();
-        history.clear();history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;hits_untracked=false;history_level=3;history_queue=1;checkpoint_stats={};lost={};
+        history.clear();
+        compressor.Reset();
+        history_bytes=0;history_frame=~0ull;rewind_enabled=false;history_interval=1;history_force=false;hits_untracked=false;history_level=3;history_queue=1;checkpoint_stats={};lost={};
         replaying=false;position_at_hit=false;
         predicate=nullptr;predicate_mask=0;
         hio_pending = 0;
@@ -1365,7 +1367,9 @@ public:
                 if(queue>4)throw std::invalid_argument("rewind compression_queue 0..4");
                 rewind_enabled=p.at("enabled");history_capacity=capacity;history_budget=u64(budget)<<20;
                 history_interval=interval;history_force=false;history_level=level;history_queue=queue;checkpoint_stats={};
-                history.clear();history_bytes=0;lost={};history_frame=~0ull;compressor.ResetPeak();return HistoryStatus();
+                history.clear();
+                compressor.Reset();
+                history_bytes=0;lost={};history_frame=~0ull;return HistoryStatus();
             }
             if(op=="reverse_step")return Reverse(p.at("core").get<u32>());
             if(op=="reverse_continue")return ReverseContinue();

@@ -101,9 +101,12 @@ public:
         std::scoped_lock lock{mutex};
         return {pending, pending_bytes, peak_pending_bytes};
     }
-    void ResetPeak() {
-        std::scoped_lock lock{mutex};
-        peak_pending_bytes = pending_bytes;
+    // The caller has dropped history. Wait for the active job to release its buffer before
+    // a new configuration can allocate checkpoints, including when switching to depth zero.
+    void Reset() {
+        std::unique_lock lock{mutex};
+        changed.wait(lock, [&] { return pending == 0; });
+        peak_pending_bytes = 0;
     }
 
 private:
