@@ -173,6 +173,8 @@ private:
         return {{"budget_source", stats.budget_extension ? "VK_EXT_memory_budget"
                                                          : "vma_estimate"},
                 {"allocation_failures", stats.allocation_failures},
+                {"adapter_dedicated_usage_bytes", stats.adapter_dedicated_usage_bytes
+                     ? Json(*stats.adapter_dedicated_usage_bytes) : Json(nullptr)},
                 {"heaps", std::move(heaps)}};
 #else
         return nullptr;

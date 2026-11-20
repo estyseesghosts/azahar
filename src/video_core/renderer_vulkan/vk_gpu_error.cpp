@@ -4,13 +4,21 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_gpu_error.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+#endif
 
 namespace Vulkan {
 
@@ -76,6 +84,72 @@ bool Inject() {
     return index != 0 && allocations.fetch_add(1, std::memory_order_relaxed) + 1 == index;
 }
 
+#ifdef _WIN32
+// WDDM reports all dedicated allocations on the Vulkan adapter, even when that
+// adapter's per-process Vulkan budget has not changed.
+class DedicatedUsage {
+public:
+    ~DedicatedUsage() {
+        Close();
+    }
+
+    void Open(VkPhysicalDevice device) {
+        VkPhysicalDeviceIDProperties id{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &id};
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2(device, &properties);
+        if (!id.deviceLUIDValid || id.deviceNodeMask != 1 ||
+            properties.properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            return;
+        }
+        static_assert(sizeof(LUID) == VK_LUID_SIZE);
+        LUID luid{};
+        std::memcpy(&luid, id.deviceLUID, sizeof(luid));
+        const auto path = fmt::format(
+            R"(\GPU Adapter Memory(luid_0x{:08x}_0x{:08x}_phys_0)\Dedicated Usage)",
+            static_cast<u32>(luid.HighPart), static_cast<u32>(luid.LowPart));
+        if (PdhOpenQueryA(nullptr, 0, &query) != ERROR_SUCCESS ||
+            PdhAddEnglishCounterA(query, path.c_str(), 0, &counter) != ERROR_SUCCESS) {
+            Close();
+        }
+    }
+
+    void Close() {
+        if (query) {
+            PdhCloseQuery(query);
+            query = nullptr;
+        }
+        usage.reset();
+        sampled = {};
+    }
+
+    std::optional<u64> Read() {
+        using namespace std::chrono_literals;
+        const auto now = std::chrono::steady_clock::now();
+        if (query && now - sampled >= 500ms) {
+            sampled = now;
+            PDH_FMT_COUNTERVALUE value{};
+            if (PdhCollectQueryData(query) == ERROR_SUCCESS &&
+                PdhGetFormattedCounterValue(counter, PDH_FMT_LARGE, nullptr, &value) ==
+                    ERROR_SUCCESS &&
+                (value.CStatus == PDH_CSTATUS_VALID_DATA || value.CStatus == PDH_CSTATUS_NEW_DATA) &&
+                value.largeValue >= 0) {
+                usage = static_cast<u64>(value.largeValue);
+            } else {
+                usage.reset();
+            }
+        }
+        return usage;
+    }
+
+private:
+    PDH_HQUERY query{};
+    PDH_HCOUNTER counter{};
+    std::chrono::steady_clock::time_point sampled{};
+    std::optional<u64> usage;
+};
+#endif
+
 struct Accounting {
     std::mutex mutex;
     VmaAllocator allocator = VK_NULL_HANDLE;
@@ -84,6 +158,9 @@ struct Accounting {
     std::array<std::atomic<u64>, VK_MAX_MEMORY_HEAPS> high_water{};
     /// Memory type -> heap, filled at registration before any allocation.
     std::array<std::atomic<u32>, VK_MAX_MEMORY_TYPES> heap_of{};
+#ifdef _WIN32
+    DedicatedUsage dedicated_usage;
+#endif
 };
 
 Accounting& Accounts() {
@@ -283,12 +360,20 @@ void RegisterAllocator(VmaAllocator allocator, bool budget_extension) {
     }
     accounts.allocator = allocator;
     accounts.budget_extension = budget_extension;
+#ifdef _WIN32
+    VmaAllocatorInfo info{};
+    vmaGetAllocatorInfo(allocator, &info);
+    accounts.dedicated_usage.Open(info.physicalDevice);
+#endif
 }
 
 void UnregisterAllocator() {
     auto& accounts = Accounts();
     std::scoped_lock lock{accounts.mutex};
     accounts.allocator = VK_NULL_HANDLE;
+#ifdef _WIN32
+    accounts.dedicated_usage.Close();
+#endif
 }
 
 GpuMemoryStats QueryGpuMemory() {
@@ -301,6 +386,9 @@ GpuMemoryStats QueryGpuMemory() {
     }
     stats.available = true;
     stats.budget_extension = accounts.budget_extension;
+#ifdef _WIN32
+    stats.adapter_dedicated_usage_bytes = accounts.dedicated_usage.Read();
+#endif
     const VkPhysicalDeviceMemoryProperties* properties{};
     vmaGetMemoryProperties(accounts.allocator, &properties);
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};

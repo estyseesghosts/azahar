@@ -206,6 +206,9 @@ if (ENABLE_VULKAN)
         shader/generator/spv_fs_shader_gen.h
     )
     target_link_libraries(video_core PRIVATE vulkan-headers vma sirit SPIRV glslang)
+    if (WIN32)
+        target_link_libraries(video_core PRIVATE pdh)
+    endif()
 endif()
 
 if(ENABLE_SDL2)
