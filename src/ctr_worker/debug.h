@@ -1121,15 +1121,21 @@ public:
             return {{"focused", AudioCore::WorkerSink::focused}};
         }
         if (op == "audio_capture") {
-            const auto directory = root / "audio";
-            std::filesystem::create_directories(directory);
-            if (p.at("enabled").get<bool>()) AudioCore::WorkerSink::CaptureStart(directory / "capture.wav");
-            else AudioCore::WorkerSink::CaptureStop();
-            Json result = {{"path", "audio/capture.wav"}, {"pcm_bytes", AudioCore::WorkerSink::capture_bytes},
-                    {"limit_reached", AudioCore::WorkerSink::capture_full},
+            const bool enabled = p.at("enabled").get<bool>();
+            const auto capture = enabled ? AudioCore::WorkerSink::CaptureStart(root / "audio/capture.wav") :
+                                           AudioCore::WorkerSink::CaptureStop();
+            Json result = {{"path", "audio/capture.wav"}, {"pcm_bytes", capture.pcm_bytes},
+                    {"state", capture.Name()}, {"limit_reached", capture.limit_reached},
+                    {"queue_overflow", capture.queue_overflow},
+                    {"queued_pcm_bytes", capture.queued_bytes},
+                    {"queue_peak_pcm_bytes", capture.queue_peak_bytes},
+                    {"queue_capacity_pcm_bytes", AudioCore::WorkerWavCapture::queue_capacity},
+                    {"dropped_blocks", capture.dropped_blocks}, {"dropped_frames", capture.dropped_frames},
                     {"sample_rate", AudioCore::native_sample_rate}, {"channels", 2}, {"sample_format", "s16le"},
                     {"domain", "raw_DSP_before_host_volume_and_stretching"}};
-            if (!p.at("enabled").get<bool>() && std::filesystem::exists(directory/"capture.wav"))
+            if (capture.error)
+                result["error"] = capture.error;
+            if (!enabled && capture.Published())
                 result["artifacts"]=Json::array({{{"path","audio/capture.wav"},{"format","wav"}}});
             return result;
         }

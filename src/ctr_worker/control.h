@@ -149,7 +149,16 @@ public:
             std::fflush(nullptr);
             std::_Exit(exit_code ? exit_code : 1);
         }
-        AudioCore::WorkerSink::CaptureStop();
+        const auto capture = AudioCore::WorkerSink::CaptureStop();
+        if (capture.phase == AudioCore::WorkerWavCapture::Phase::Finalizing) {
+            std::cerr << "worker_shutdown_error: WAV capture finalization timed out\n";
+            writer.Close();
+            Common::Log::Stop();
+            std::fflush(nullptr);
+            std::_Exit(1);
+        }
+        if (capture.error)
+            std::cerr << "worker_audio_capture_error: " << capture.error << '\n';
         writer.Close();
         Common::Log::Stop();
         return exit_code;
