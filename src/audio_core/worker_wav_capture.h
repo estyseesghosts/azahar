@@ -60,7 +60,8 @@ class WorkerWavCapture {
         }
     };
 
-    explicit WorkerWavCapture(BeforeWrite before_write = nullptr) : before_write{before_write} {}
+    WorkerWavCapture() = default;
+    explicit WorkerWavCapture(BeforeWrite before_write) : before_write{before_write} {}
 
     ~WorkerWavCapture() {
         if (writer.joinable()) {
@@ -172,7 +173,7 @@ class WorkerWavCapture {
     };
 
     std::shared_ptr<Shared> state = std::make_shared<Shared>();
-    BeforeWrite before_write;
+    BeforeWrite before_write = nullptr;
     std::thread writer;
 
     static bool Terminal(Phase phase) {
