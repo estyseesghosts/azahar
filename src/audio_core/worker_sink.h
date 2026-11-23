@@ -2,12 +2,12 @@
 #pragma once
 #include <algorithm>
 #include <array>
-#include <fstream>
 #include <filesystem>
 #include <mutex>
 #include <stdexcept>
 #include "audio_core/sink.h"
 #include "audio_core/sink_details.h"
+#include "audio_core/worker_wav_capture.h"
 #include "common/settings.h"
 namespace AudioCore {
 struct WorkerAudioStats {
@@ -21,9 +21,6 @@ public:
     inline static WorkerAudioStats stats;
     inline static WorkerSink* active = nullptr;
     inline static bool focused = false;
-    inline static std::ofstream capture;
-    inline static u32 capture_bytes = 0;
-    inline static bool capture_full = false;
     WorkerSink() { active = this; if (focused) SetFocus(true); }
     ~WorkerSink() override { output.reset(); active = nullptr; }
     unsigned GetNativeSampleRate() const override { return native_sample_rate; }
@@ -55,44 +52,24 @@ public:
             stats.hash = (stats.hash ^ (value & 255)) * 1099511628211ull;
             stats.hash = (stats.hash ^ (value >> 8)) * 1099511628211ull;
         }
-        if (capture.is_open()) {
-            constexpr size_t limit = (64u << 20) - 44; // Include the WAV header in the file budget.
-            const auto bytes = std::min(count * 4, limit - capture_bytes);
-            capture.write(static_cast<const char*>(data), bytes);
-            capture_bytes += static_cast<u32>(bytes);
-            if (bytes < count * 4) capture_full = true;
-        }
+        capture.Push(data, count);
         stats.samples += count;
         const auto total = stats.buffered + count;
         stats.dropped += total > ring.size() / 2 ? total - ring.size() / 2 : 0;
         stats.buffered = std::min(total, ring.size() / 2);
     }
-    static void Header(u32 bytes) {
-        const auto le = [](u32 v, unsigned count) {
-            for (unsigned i=0;i<count;++i) capture.put(static_cast<char>(v >> (8*i)));
-        };
-        capture.seekp(0); capture.write("RIFF",4);le(bytes+36,4);capture.write("WAVEfmt ",8);
-        le(16,4);le(1,2);le(2,2);le(native_sample_rate,4);le(native_sample_rate*4,4);
-        le(4,2);le(16,2);capture.write("data",4);le(bytes,4);
+    static WorkerWavCapture::Status CaptureStart(const std::filesystem::path& path) {
+        return capture.Start(path, native_sample_rate);
     }
-    static void CaptureStart(const std::filesystem::path& path) {
-        std::scoped_lock lock{mutex};
-        if (capture.is_open()) throw std::invalid_argument("audio capture already active");
-        capture.open(path, std::ios::binary | std::ios::trunc);
-        if (!capture) throw std::runtime_error("cannot create WAV capture");
-        capture.exceptions(std::ios::badbit | std::ios::failbit);
-        capture_bytes = 0;capture_full = false;Header(0);
-    }
-    static u32 CaptureStop() {
-        std::scoped_lock lock{mutex};
-        if (!capture.is_open()) return capture_bytes;
-        Header(capture_bytes);capture.flush();capture.close();return capture_bytes;
+    static WorkerWavCapture::Status CaptureStop() {
+        return capture.Stop();
     }
     static WorkerAudioStats Drain() {
         std::scoped_lock lock{mutex}; const auto snapshot=stats;stats.buffered=0;return snapshot;
     }
     static void Reset() { CaptureStop(); std::scoped_lock lock{mutex};stats={}; }
 private:
+    inline static WorkerWavCapture capture;
     std::function<void(s16*, std::size_t)> callback;
     std::unique_ptr<Sink> output;
 };
