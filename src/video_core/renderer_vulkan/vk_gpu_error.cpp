@@ -29,10 +29,18 @@ std::optional<GpuError> fault;
 std::atomic_bool faulted = false;
 std::atomic_bool acknowledged = false;
 std::atomic<u64> failures = 0;
+std::atomic_bool memory_invalidated = false;
+
+using Clock = std::chrono::steady_clock;
+
+u64 ElapsedNs(Clock::time_point since) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - since).count();
+}
 std::atomic<u64> allocations = 0;
 std::atomic<GpuFailureHandler> failure_handler = nullptr;
 
 void Handle(const GpuError& error) {
+    InvalidateGpuMemory();
     if (const GpuFailureHandler handler = failure_handler.load(std::memory_order_acquire)) {
         handler(*DescribeGpuFailure(error));
     }
@@ -120,14 +128,10 @@ public:
             query = nullptr;
         }
         usage.reset();
-        sampled = {};
     }
 
     std::optional<u64> Read() {
-        using namespace std::chrono_literals;
-        const auto now = std::chrono::steady_clock::now();
-        if (query && now - sampled >= 500ms) {
-            sampled = now;
+        if (query) {
             PDH_FMT_COUNTERVALUE value{};
             if (PdhCollectQueryData(query) == ERROR_SUCCESS &&
                 PdhGetFormattedCounterValue(counter, PDH_FMT_LARGE, nullptr, &value) ==
@@ -145,13 +149,18 @@ public:
 private:
     PDH_HQUERY query{};
     PDH_HCOUNTER counter{};
-    std::chrono::steady_clock::time_point sampled{};
     std::optional<u64> usage;
 };
 #endif
 
 struct Accounting {
+    // The allocator lock pins VMA and its physical device during slow sampling.
     std::mutex mutex;
+    // The published sample has a separate lock, never held across driver calls.
+    std::mutex sample_mutex;
+    GpuMemoryStats sample;
+    Clock::time_point sampled_at{};
+    u64 sample_sequence = 0;
     VmaAllocator allocator = VK_NULL_HANDLE;
     bool budget_extension = false;
     std::array<std::atomic<u64>, VK_MAX_MEMORY_HEAPS> live{};
@@ -358,6 +367,12 @@ void RegisterAllocator(VmaAllocator allocator, bool budget_extension) {
         accounts.heap_of[type].store(properties->memoryTypes[type].heapIndex,
                                      std::memory_order_relaxed);
     }
+    {
+        std::scoped_lock sample_lock{accounts.sample_mutex};
+        accounts.sample = GpuMemoryStats{.available = true, .budget_extension = budget_extension};
+        accounts.sampled_at = {};
+    }
+    memory_invalidated.store(false, std::memory_order_release);
     accounts.allocator = allocator;
     accounts.budget_extension = budget_extension;
 #ifdef _WIN32
@@ -371,28 +386,43 @@ void UnregisterAllocator() {
     auto& accounts = Accounts();
     std::scoped_lock lock{accounts.mutex};
     accounts.allocator = VK_NULL_HANDLE;
+    {
+        std::scoped_lock sample_lock{accounts.sample_mutex};
+        accounts.sample = {};
+        accounts.sampled_at = {};
+    }
 #ifdef _WIN32
     accounts.dedicated_usage.Close();
 #endif
 }
 
-GpuMemoryStats QueryGpuMemory() {
+void InvalidateGpuMemory() {
+    memory_invalidated.store(true, std::memory_order_release);
+}
+
+void SampleGpuMemory() {
     auto& accounts = Accounts();
+    const auto start = Clock::now();
     std::scoped_lock lock{accounts.mutex};
-    GpuMemoryStats stats;
-    stats.allocation_failures = failures.load(std::memory_order_relaxed);
-    if (accounts.allocator == VK_NULL_HANDLE) {
-        return stats;
+    if (accounts.allocator == VK_NULL_HANDLE ||
+        memory_invalidated.load(std::memory_order_acquire)) {
+        return;
     }
-    stats.available = true;
-    stats.budget_extension = accounts.budget_extension;
+    const auto sampled_at = Clock::now();
+    GpuMemoryStats stats{.available = true, .budget_extension = accounts.budget_extension};
+    stats.accounting_wait_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(sampled_at - start).count();
 #ifdef _WIN32
+    const auto adapter_start = Clock::now();
     stats.adapter_dedicated_usage_bytes = accounts.dedicated_usage.Read();
+    stats.adapter_ns = ElapsedNs(adapter_start);
 #endif
     const VkPhysicalDeviceMemoryProperties* properties{};
     vmaGetMemoryProperties(accounts.allocator, &properties);
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    const auto vma_start = Clock::now();
     vmaGetHeapBudgets(accounts.allocator, budgets.data());
+    stats.vma_ns = ElapsedNs(vma_start);
     VkPhysicalDeviceMemoryBudgetPropertiesEXT live_budget{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT,
     };
@@ -405,8 +435,10 @@ GpuMemoryStats QueryGpuMemory() {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
             .pNext = &live_budget,
         };
+        const auto vulkan_start = Clock::now();
         VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties2(info.physicalDevice,
-                                                                           &memory);
+                                                                          &memory);
+        stats.vulkan_ns = ElapsedNs(vulkan_start);
     }
     for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
         stats.heaps.push_back({
@@ -415,11 +447,40 @@ GpuMemoryStats QueryGpuMemory() {
             .size = properties->memoryHeaps[heap].size,
             .budget = stats.budget_extension ? live_budget.heapBudget[heap] : budgets[heap].budget,
             .usage = stats.budget_extension ? live_budget.heapUsage[heap] : budgets[heap].usage,
-            .block_bytes = accounts.live[heap].load(std::memory_order_relaxed),
-            .block_bytes_high_water = accounts.high_water[heap].load(std::memory_order_relaxed),
             .allocation_bytes = budgets[heap].statistics.allocationBytes,
         });
     }
+    stats.sample_ns = ElapsedNs(sampled_at);
+    std::scoped_lock sample_lock{accounts.sample_mutex};
+    stats.sample_sequence = ++accounts.sample_sequence;
+    accounts.sample = std::move(stats);
+    accounts.sampled_at = sampled_at;
+}
+
+GpuMemoryStats QueryGpuMemory(bool failure_report) {
+    auto& accounts = Accounts();
+    GpuMemoryStats stats;
+    {
+        std::unique_lock lock{accounts.sample_mutex, std::defer_lock};
+        // A fatal error can arrive on a renderer thread. Never wait for the sampler here.
+        if (!failure_report || lock.try_lock()) {
+            if (!failure_report)
+                lock.lock();
+            stats = accounts.sample;
+            if (stats.sample_sequence) {
+                const auto age = Clock::now() - accounts.sampled_at;
+                stats.sample_age_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(age).count();
+            }
+            for (u32 heap = 0; heap < stats.heaps.size(); ++heap) {
+                stats.heaps[heap].block_bytes = accounts.live[heap].load(std::memory_order_relaxed);
+                stats.heaps[heap].block_bytes_high_water =
+                    accounts.high_water[heap].load(std::memory_order_relaxed);
+            }
+        }
+    }
+    stats.allocation_failures = failures.load(std::memory_order_relaxed);
+    stats.invalidated = memory_invalidated.load(std::memory_order_acquire);
     return stats;
 }
 
