@@ -353,6 +353,21 @@ void GPU::SetColorFill(const Pica::ColorFill& fill) {
     impl->pica.regs_lcd.color_fill_bottom = fill;
 }
 
+bool GPU::IsRegister(VAddr addr) {
+    if (addr % sizeof(u32) != 0) {
+        return false;
+    }
+    switch (addr & 0xFFFFF000) {
+    case VADDR_LCD:
+        return (addr - VADDR_LCD) / sizeof(u32) < Pica::RegsLcd::NumIds();
+    case VADDR_GPU:
+    case VADDR_GPU + 0x1000:
+        return (addr - VADDR_GPU) / sizeof(u32) < Pica::PicaCore::Regs::NUM_REGS;
+    default:
+        return false;
+    }
+}
+
 u32 GPU::ReadReg(VAddr addr) {
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
