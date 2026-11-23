@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -55,7 +56,7 @@ const std::string& InjectionMode() {
     return mode;
 }
 
-/// "file" mode: `<LOTUS_STORAGE_ROOT>/vk-fail-alloc` holding N arms a failure of the Nth
+/// "file" and "device_lost_file" modes: `<LOTUS_STORAGE_ROOT>/vk-fail-alloc` holding N arms a failure of the Nth
 /// following allocation; the file is consumed when read. Checked on every allocation, which
 /// only happens when the mode is set.
 bool InjectFromFile() {
@@ -80,16 +81,17 @@ bool InjectFromFile() {
     return remaining != 0 && --remaining == 0;
 }
 
-bool Inject() {
+VkResult InjectAllocationError() {
     const std::string& mode = InjectionMode();
-    if (mode.empty()) {
-        return false;
+    if (mode == "file" || mode == "device_lost_file") {
+        if (!InjectFromFile()) {
+            return VK_SUCCESS;
+        }
+        return mode == "file" ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_DEVICE_LOST;
     }
-    if (mode == "file") {
-        return InjectFromFile();
-    }
-    const u64 index = std::strtoull(mode.c_str(), nullptr, 10);
-    return index != 0 && allocations.fetch_add(1, std::memory_order_relaxed) + 1 == index;
+    const u64 index = mode.empty() ? 0 : std::strtoull(mode.c_str(), nullptr, 10);
+    const bool inject = index != 0 && allocations.fetch_add(1, std::memory_order_relaxed) + 1 == index;
+    return inject ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
 }
 
 #ifdef _WIN32
@@ -147,6 +149,10 @@ public:
             }
         }
         return usage;
+    }
+
+    Clock::time_point SampledAt() const {
+        return sampled_at;
     }
 
 private:
@@ -334,10 +340,11 @@ void CreateImage(VmaAllocator allocator, const VkImageCreateInfo& image_info,
                  const VmaAllocationCreateInfo& alloc_info, VkImage* image,
                  VmaAllocation* allocation, VmaAllocationInfo* allocation_info,
                  const std::string& object) {
-    const VkResult result =
-        Inject() ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                 : vmaCreateImage(allocator, &image_info, &alloc_info, image, allocation,
-                                  allocation_info);
+    VkResult result = InjectAllocationError();
+    if (result == VK_SUCCESS) {
+        result = vmaCreateImage(allocator, &image_info, &alloc_info, image, allocation,
+                                allocation_info);
+    }
     if (result != VK_SUCCESS) [[unlikely]] {
         ThrowGpuError(result, object + " " + std::to_string(image_info.extent.width) + "x" +
                                   std::to_string(image_info.extent.height));
@@ -348,10 +355,11 @@ void CreateBuffer(VmaAllocator allocator, const VkBufferCreateInfo& buffer_info,
                   const VmaAllocationCreateInfo& alloc_info, VkBuffer* buffer,
                   VmaAllocation* allocation, VmaAllocationInfo* allocation_info,
                   const std::string& object) {
-    const VkResult result =
-        Inject() ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                 : vmaCreateBuffer(allocator, &buffer_info, &alloc_info, buffer, allocation,
-                                   allocation_info);
+    VkResult result = InjectAllocationError();
+    if (result == VK_SUCCESS) {
+        result = vmaCreateBuffer(allocator, &buffer_info, &alloc_info, buffer, allocation,
+                                 allocation_info);
+    }
     if (result != VK_SUCCESS) [[unlikely]] {
         ThrowGpuError(result, object + " " + std::to_string(buffer_info.size) + " bytes");
     }
@@ -459,6 +467,13 @@ void SampleGpuMemory(bool sync_status) {
     stats.sample_sequence = ++accounts.sample_sequence;
     accounts.sample = std::move(stats);
     accounts.sampled_at = sampled_at;
+#ifdef _WIN32
+    // In synchronous rollback mode, the WDDM counter may have been sampled earlier
+    // than Vulkan. Bound admission freshness by the oldest contributing source.
+    if (accounts.sample.adapter_dedicated_usage_bytes) {
+        accounts.sampled_at = std::min(sampled_at, accounts.dedicated_usage.SampledAt());
+    }
+#endif
 }
 
 GpuMemoryStats QueryGpuMemory(bool failure_report) {
