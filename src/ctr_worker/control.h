@@ -57,17 +57,26 @@ public:
 #endif
         std::thread reader{[this] {
             stdin_reader.Enter();
-            while (!stopping) {
+            // Waits for a free request credit before reading the next frame (lotus#160).
+            auto status = ReceiveStatus::interrupted;
+            while (!stopping && requests.Acquire()) {
                 Json request;
-                if (!Receive(request, stopping))
+                status = Receive(request, stopping);
+                if (status != ReceiveStatus::ok) {
+                    requests.Cancel();
                     break;
+                }
                 {
                     std::scoped_lock lock{mutex};
-                    if (queue.size() >= 16)
-                        break;
                     queue.push_back(std::move(request));
                 }
                 system.NotifyPendingWork();
+            }
+            if (Malformed(status)) {
+                malformed_request = true;
+                std::cerr << "worker_control_error: " << Describe(status) << '\n';
+            } else if (status == ReceiveStatus::closed) {
+                std::cerr << "worker_control_closed: " << Describe(status) << '\n';
             }
             disconnected = true;
             stdin_reader.Exit();
@@ -129,8 +138,11 @@ public:
         if (writer.Failed())
             exit_code = 1;
         stopping = true;
+        requests.Close();
         stdin_reader.Interrupt();
         reader.join();
+        if (malformed_request && !exit_code)
+            exit_code = 1;
         Frontend::control_callback = {};
         debug.Detach();
         // After an allocation failure the renderer is shut down normally, which releases its
@@ -183,7 +195,7 @@ private:
                 {"audio_focused", AudioCore::WorkerSink::focused},
                 {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered},
                 {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"},
-                {"transport", writer.Stats()}, {"gpu_memory", GpuMemory()},
+                {"transport", TransportStats()}, {"gpu_memory", GpuMemory()},
                 {"features", Features()}};
         if (auto& gpu = snapshot["gpu_memory"]; GpuMemoryProfiling() && gpu.is_object()) {
             gpu["snapshot_ns"] = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -324,6 +336,11 @@ private:
     static inline Control* active = nullptr;
     static inline std::thread::id main_thread;
 #endif
+    Json TransportStats() {
+        auto stats = writer.Stats();
+        stats["requests"] = requests.Stats();
+        return stats;
+    }
     void Reply(const Json& request, const std::string& status, Json data = nullptr) {
         writer.Post({{"version_major", 1},
               {"version_minor", 0},
@@ -334,7 +351,7 @@ private:
               {"state", state},
               {"backend", "azahar_native_software"},
               {"data", std::move(data)}},
-             true);
+             true, true);
     }
     void Drain(bool nested) {
         // Never destroy/reinitialize a core while inside its RunLoop/frame limiter.
@@ -712,8 +729,9 @@ private:
     std::optional<Json> pending_run;
     std::mutex mutex;
     std::deque<Json> queue;
-    std::atomic_bool stopping = false, disconnected = false;
+    std::atomic_bool stopping = false, disconnected = false, malformed_request = false;
     StdinReader stdin_reader;
-    ControlWriter writer;
+    RequestWindow requests;
+    ControlWriter writer{requests};
 };
 } // namespace CtrWorker

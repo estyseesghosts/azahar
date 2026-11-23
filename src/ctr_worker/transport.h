@@ -58,42 +58,141 @@ private:
     std::atomic<HANDLE> thread = nullptr;
 #endif
 };
-inline bool ReadExact(char* data, size_t size, const std::atomic_bool& stop) {
-    while (size && !stop) {
+// Bytes read before end of stream, an error, or `stop`.
+inline size_t ReadExact(char* data, size_t size, const std::atomic_bool& stop) {
+    size_t total = 0;
+    while (total < size && !stop) {
 #ifdef _WIN32
         // Blocks until bytes arrive, the host closes the pipe, or StdinReader::Interrupt.
         DWORD received = 0;
-        if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), data,
-                      static_cast<DWORD>(std::min<size_t>(size, 65536)), &received, nullptr) ||
+        if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), data + total,
+                      static_cast<DWORD>(std::min<size_t>(size - total, 65536)), &received,
+                      nullptr) ||
             !received)
-            return false;
+            break;
 #else
         pollfd descriptor{STDIN_FILENO, POLLIN, 0};
         if (poll(&descriptor, 1, 10) <= 0)
             continue;
-        const auto received = read(STDIN_FILENO, data, size);
+        const auto received = read(STDIN_FILENO, data + total, size - total);
         if (received <= 0)
-            return false;
+            break;
 #endif
-        data += received;
-        size -= received;
+        total += static_cast<size_t>(received);
     }
-    return size == 0;
+    return total;
 }
-inline bool Receive(nlohmann::json& request, const std::atomic_bool& stop) {
+// Why the reader stopped taking requests. `closed` is end of stream or a read error at a frame
+// boundary; `interrupted` is worker shutdown. The other failures are malformed host input.
+enum class ReceiveStatus { ok, closed, interrupted, truncated, bad_length, bad_json };
+inline const char* Describe(ReceiveStatus status) {
+    switch (status) {
+    case ReceiveStatus::ok:
+        return "ok";
+    case ReceiveStatus::closed:
+        return "request stream closed";
+    case ReceiveStatus::interrupted:
+        return "reader interrupted by shutdown";
+    case ReceiveStatus::truncated:
+        return "request frame truncated";
+    case ReceiveStatus::bad_length:
+        return "request frame length outside 1..65536";
+    case ReceiveStatus::bad_json:
+        return "request frame is not JSON";
+    }
+    return "unknown";
+}
+inline bool Malformed(ReceiveStatus status) {
+    return status == ReceiveStatus::truncated || status == ReceiveStatus::bad_length ||
+           status == ReceiveStatus::bad_json;
+}
+inline ReceiveStatus Receive(nlohmann::json& request, const std::atomic_bool& stop) {
     unsigned char prefix[4];
-    if (!ReadExact(reinterpret_cast<char*>(prefix), 4, stop))
-        return false;
+    if (const auto received = ReadExact(reinterpret_cast<char*>(prefix), 4, stop); received != 4)
+        return stop       ? ReceiveStatus::interrupted
+               : received ? ReceiveStatus::truncated
+                          : ReceiveStatus::closed;
     const u32 size =
         u32{prefix[0]} | (u32{prefix[1]} << 8) | (u32{prefix[2]} << 16) | (u32{prefix[3]} << 24);
     if (!size || size > 65536)
-        return false;
+        return ReceiveStatus::bad_length;
     std::string payload(size, '\0');
-    if (!ReadExact(payload.data(), size, stop))
-        return false;
+    if (ReadExact(payload.data(), size, stop) != size)
+        return stop ? ReceiveStatus::interrupted : ReceiveStatus::truncated;
     request = nlohmann::json::parse(payload, nullptr, false);
-    return !request.is_discarded();
+    return request.is_discarded() ? ReceiveStatus::bad_json : ReceiveStatus::ok;
 }
+// Control request admission (lotus#160). A request holds a credit from when the reader takes it
+// off stdin until the writer has written its reply, so queued requests plus unwritten replies
+// never exceed LIMIT. At the limit the reader stops reading stdin and the host's writes block on
+// the pipe. Before, a 17th queued request made the reader disconnect and the worker exit, and
+// replies the host did not read could grow the writer queue without bound. The emulation thread
+// never waits here; Close() releases a waiting reader at shutdown.
+class RequestWindow {
+public:
+    static constexpr size_t LIMIT = 16;
+    // Reader thread, before reading the next frame. False once closed.
+    bool Acquire() {
+        std::unique_lock lock{mutex};
+        if (in_flight >= LIMIT && !closed) {
+            ++waits;
+            const auto start = std::chrono::steady_clock::now();
+            available.wait(lock, [this] { return in_flight < LIMIT || closed; });
+            const auto waited = static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
+            wait_us_total += waited;
+            wait_us_max = std::max(wait_us_max, waited);
+        }
+        if (closed)
+            return false;
+        peak = std::max(peak, ++in_flight);
+        return true;
+    }
+    // Returns the credit of a frame that never became a request.
+    void Cancel() {
+        Release(false);
+    }
+    // Writer thread, after a reply reached the pipe.
+    void Complete() {
+        Release(true);
+    }
+    void Close() {
+        {
+            std::scoped_lock lock{mutex};
+            closed = true;
+        }
+        available.notify_all();
+    }
+    // `in_flight` includes the status request that reads it.
+    nlohmann::json Stats() {
+        std::scoped_lock lock{mutex};
+        return {{"limit", LIMIT},
+                {"in_flight", in_flight},
+                {"peak", peak},
+                {"completed", completed},
+                {"backpressure_waits", waits},
+                {"backpressure_wait_us_total", wait_us_total},
+                {"backpressure_wait_us_max", wait_us_max}};
+    }
+
+private:
+    void Release(bool replied) {
+        {
+            std::scoped_lock lock{mutex};
+            if (in_flight)
+                --in_flight;
+            completed += replied;
+        }
+        available.notify_one();
+    }
+    std::mutex mutex;
+    std::condition_variable available;
+    size_t in_flight = 0, peak = 0;
+    unsigned long long completed = 0, waits = 0, wait_us_total = 0, wait_us_max = 0;
+    bool closed = false;
+};
 // The control channel owns the original stdout. Everything else that writes to
 // stdout (Teakra, third-party printf) is redirected to stderr so it can never
 // corrupt reply framing.
@@ -143,19 +242,23 @@ inline std::string Frame(const nlohmann::json& message) {
 // formats a frame or blocks on the pipe (lotus#26). Before, every reply and notification was
 // dumped and written synchronously by the thread that produced it; a host that read slowly
 // stalled emulation, and every PICA, SVC or log event cost a pipe write. Replies and reliable
-// notifications (debug stops) keep their order and are never dropped; they are bounded by
-// the request queue (16) and by one stop per resume. Best-effort notifications are bounded
+// notifications (debug stops) keep their order and are never dropped. Replies are bounded by
+// RequestWindow, which counts a request until its reply is written; reliable notifications are
+// bounded by one stop per resume. Best-effort notifications are bounded
 // at BEST_EFFORT_LIMIT: a new one past the bound drops the oldest queued one, counted in
 // `dropped` and reported in every later notification as `notifications_dropped`.
 class ControlWriter {
 public:
     static constexpr size_t BEST_EFFORT_LIMIT = 1024;
+    explicit ControlWriter(RequestWindow& requests) : requests(requests) {}
     void Start() {
         if (ControlOutput() < 0)
             throw std::runtime_error("control output not reserved");
         thread = std::thread([this] { Loop(); });
     }
-    void Post(nlohmann::json message, bool reliable) {
+    // `reply` marks the one reply to a request RequestWindow admitted; writing it returns the
+    // request's credit.
+    void Post(nlohmann::json message, bool reliable, bool reply = false) {
         {
             std::scoped_lock lock{mutex};
             if (failed || closing)
@@ -173,7 +276,7 @@ public:
                     ++best_effort;
                 }
             }
-            queue.push_back({std::move(message), reliable});
+            queue.push_back({std::move(message), reliable || reply, reply});
             peak = std::max(peak, queue.size());
         }
         ready.notify_one();
@@ -204,6 +307,7 @@ private:
     struct Entry {
         nlohmann::json message;
         bool reliable;
+        bool reply;
     };
     void Loop() {
         for (;;) {
@@ -239,10 +343,15 @@ private:
                 best_effort = 0;
                 return;
             }
-            std::scoped_lock lock{mutex};
-            ++written;
+            {
+                std::scoped_lock lock{mutex};
+                ++written;
+            }
+            if (entry.reply)
+                requests.Complete();
         }
     }
+    RequestWindow& requests;
     std::mutex mutex;
     std::condition_variable ready;
     std::deque<Entry> queue;
