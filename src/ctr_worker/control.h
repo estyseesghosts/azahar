@@ -34,12 +34,16 @@ public:
         RegisterCamera();
         debug.Attach();
         debug.apply_input = [this](const Json& restored) {
+            staged.reset();
             ApplyInput(input, restored.at("state"));
             owner = restored.at("owner").get<std::string>();
         };
         debug.get_input = [this] { return Json{{"owner", owner}, {"state", SnapshotInput(input)}}; };
         debug.get_frame = [this] { return window.frames; };
-        debug.set_frame = [this](u64 frame) { window.frames = frame; };
+        debug.set_frame = [this](u64 frame) {
+            window.frames = frame;
+            boundary_ticks = system.CoreTiming().GetGlobalTicks();
+        };
         // Called only for subscribed categories (DebugTools::Record); stops are reliable.
         debug.notification = [this](const Json& data, bool reliable) {
             writer.Post({{"notification", true}, {"version_major", 1}, {"version_minor", 0},
@@ -90,7 +94,11 @@ public:
                     // Build the JSON input snapshot only when a frame checkpoint will be stored.
                     if (debug.WantsFrameCheckpoint(window.frames))
                         debug.Remember(window.frames,{{"owner",owner},{"state",SnapshotInput(input)}});
+                    const u64 started = window.frames;
                     const auto result = system.RunLoop();
+                    const bool pause_here = FrameBoundary(started) && pending_pause;
+                    if (pause_here)
+                        debug.Stop("manual", {{"frame", window.frames}});
                     debug.CheckFramePredicate(window.frames);
                     if (debug.IsStopped() || result != Core::System::ResultStatus::Success || unsupported ||
                         window.frames >= target || std::chrono::steady_clock::now() >= deadline) {
@@ -104,14 +112,7 @@ public:
                                      : debug.IsStopped() && debug.StopReason().value("reason", "") != "frame" ? ""
                                      : window.frames < target ? "host_deadline"
                                                               : "";
-                        if (pending_run) {
-                            Reply(*pending_run,
-                                  last_error.empty() ? "ok"
-                                  : unsupported      ? "unsupported"
-                                                     : "not_ready",
-                                  Snapshot());
-                            pending_run.reset();
-                        }
+                        FinishRun(pause_here);
                     }
                 } else {
                     // Returns as soon as the reader queues a request. ProcessPendingWorkUntil
@@ -191,6 +192,7 @@ private:
         Json snapshot{{"debug_api", true}, {"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
                 {"stop", debug.StopReason()}, {"events", debug.EventStatus()}, {"last_error", last_error},         {"input_owner", owner},
                 {"buttons", input.buttons},         {"touch_down", input.touch},
+                {"input_staged", staged.has_value()},
                 {"audio_samples", audio.samples},   {"audio_dropped", audio.dropped},
                 {"audio_focused", AudioCore::WorkerSink::focused},
                 {"audio_hash_fnv1a64", audio.hash}, {"audio_buffered", audio.buffered},
@@ -207,7 +209,7 @@ private:
     /// that needs a feature missing here instead of sending it to a worker that would ignore
     /// it. Names are lotus_protocol::capabilities::feature constants.
     static Json Features() {
-        Json features = Json::array({"flush_storage", "event_subscriptions", "gpu_capture_levels",
+        Json features = Json::array({"input_boundary", "flush_storage", "event_subscriptions", "gpu_capture_levels",
                                     "state_hash", "deterministic_async", "analog_input", "rewind_compression_queue"});
         if (PreviewRing::Supported())
             features.push_back("preview_nonblocking");
@@ -473,6 +475,10 @@ private:
                 return;
             }
             if (method == "stop") {
+                if (pending_pause) {
+                    Reply(*pending_pause, "not_ready", {{"reason", "stopped"}});
+                    pending_pause.reset();
+                }
                 system.Movie().Shutdown();
                 debug.Clear();
                 state = "stopped";
@@ -512,6 +518,7 @@ private:
                     system.Shutdown();
                 unsupported = false;
                 input = {};
+                staged.reset();
                 window.frames = 0;
                 last_error.clear();
                 owner = "live";
@@ -531,6 +538,7 @@ private:
                 content = path;
                 debug.MovieAfterLoad();
                 state = "paused";
+                boundary_ticks = system.CoreTiming().GetGlobalTicks();
                 ++epoch;
                 Reply(request, "ok", Snapshot());
                 return;
@@ -581,6 +589,8 @@ private:
                 else
                     Reply(request, "ok", Snapshot());
             } else if (method == "pause") {
+                if (DeferPause(request))
+                    return;
                 debug.Stop("manual", Json::object());
                 state = "paused";
                 if (pending_run) {
@@ -622,24 +632,29 @@ private:
                 const auto buttons = static_cast<u32>(
                     Unsigned(params, "buttons", (1u << Settings::NativeButton::NumButtons) - 1));
                 const auto x = Unsigned(params, "x", 319), y = Unsigned(params, "y", 239);
-                const auto circle = Stick(params, "circle_pad", input.circle),
-                           cstick = Stick(params, "c_stick", input.cstick);
+                const auto circle = Stick(params, "circle_pad", staged ? staged->circle : input.circle),
+                           cstick = Stick(params, "c_stick", staged ? staged->cstick : input.cstick);
                 if (buttons >= (1u << Settings::NativeButton::NumButtons) || x >= 320 || y >= 240 ||
                     !circle || !cstick) {
                     Reply(request, "invalid_argument");
                     return;
                 }
                 owner = requested_owner;
-                // Only the sent fields change (lotus#60): a button/touch update no longer zeroes
-                // the sticks, and motion/slider state set by input_state is kept.
-                input.buttons = buttons;
-                input.x = x / 320.0f;
-                input.y = y / 240.0f;
-                input.touch = params.value("touch", false);
-                input.circle = *circle;
-                input.cstick = *cstick;
-                debug.ForceCheckpoint();
-                Reply(request, "ok", Snapshot());
+                const StagedInput next{buttons, x / 320.0f, y / 240.0f, params.value("touch", false),
+                                       *circle, *cstick};
+                // lotus#95: input takes effect at a frame boundary, the point where a bounded
+                // run_until stops and a scenario installs its input, so a live input replays
+                // exactly at `input_frame`. RunLoop returns between CPU slices, mid-frame.
+                u64 input_frame = window.frames;
+                if (state == "running" || !AtBoundary()) {
+                    staged = next;
+                    input_frame = window.frames + 1;
+                } else {
+                    ApplyStaged(next);
+                }
+                auto reply = Snapshot();
+                reply["input_frame"] = input_frame;
+                Reply(request, "ok", reply);
             } else if (method == "registers") {
                 const auto core = static_cast<u32>(Unsigned(params, "core", 3));
                 if (core >= system.GetNumCores()) {
@@ -713,6 +728,74 @@ private:
             throw std::invalid_argument("expected bounded unsigned integer");
         return params.at(key).get<u64>();
     }
+    /// Fields `input` sets, held until the next frame boundary while running (lotus#95).
+    struct StagedInput {
+        u32 buttons;
+        float x, y;
+        bool touch;
+        std::array<float, 2> circle, cstick;
+    };
+    void ApplyStaged(const StagedInput& next) {
+        // Only the sent fields change (lotus#60): a button/touch update keeps motion and
+        // slider state set by input_state.
+        input.buttons = next.buttons;
+        input.x = next.x;
+        input.y = next.y;
+        input.touch = next.touch;
+        input.circle = next.circle;
+        input.cstick = next.cstick;
+        debug.ForceCheckpoint();
+    }
+    /// After a RunLoop pass: true when it presented a frame. A pass is one CPU slice
+    /// (Core::System::RunLoop, at most Timing::MAX_SLICE_LENGTH ticks), far shorter than a
+    /// frame, so it ends just after RendererBase::EndFrame counted the frame in PollEvents.
+    /// That is where a run_until with a frame target stops, so input applied here matches a
+    /// scenario's input at the same frame.
+    bool FrameBoundary(u64 started) {
+        if (window.frames == started)
+            return false;
+        boundary_ticks = system.CoreTiming().GetGlobalTicks();
+        if (staged) {
+            ApplyStaged(*staged);
+            staged.reset();
+        }
+        return true;
+    }
+    /// The guest has not run since the last frame boundary (no slice, step or restore).
+    bool AtBoundary() {
+        return system.IsPoweredOn() && boundary_ticks &&
+               *boundary_ticks == system.CoreTiming().GetGlobalTicks();
+    }
+    /// While running, a pause completes at the next frame boundary so a paused worker sits
+    /// where a scenario run would (lotus#95). Returns true when deferred.
+    bool DeferPause(const Json& request) {
+        if (state != "running")
+            return false;
+        if (pending_pause) {
+            Reply(request, "not_ready", {{"reason", "pause_pending"}});
+            return true;
+        }
+        pending_pause = request;
+        return true;
+    }
+    /// Answer the run_until and pause waiting on a run that just stopped.
+    void FinishRun(bool pause_here) {
+        if (pending_run) {
+            if (pause_here && window.frames < target)
+                Reply(*pending_run, "not_ready", {{"reason", "interrupted"}});
+            else
+                Reply(*pending_run,
+                      last_error.empty() ? "ok"
+                      : unsupported      ? "unsupported"
+                                         : "not_ready",
+                      Snapshot());
+            pending_run.reset();
+        }
+        if (pending_pause) {
+            Reply(*pending_pause, "ok", Snapshot());
+            pending_pause.reset();
+        }
+    }
     Core::System& system = Core::System::GetInstance();
     std::filesystem::path root;
     Window window;
@@ -726,7 +809,9 @@ private:
     /// Exit code after a typed GPU failure, distinct from 1 (protocol or control error).
     static constexpr int GPU_FAILURE_EXIT = 4;
     std::chrono::steady_clock::time_point deadline;
-    std::optional<Json> pending_run;
+    std::optional<Json> pending_run, pending_pause;
+    std::optional<StagedInput> staged;
+    std::optional<s64> boundary_ticks;
     std::mutex mutex;
     std::deque<Json> queue;
     std::atomic_bool stopping = false, disconnected = false, malformed_request = false;
