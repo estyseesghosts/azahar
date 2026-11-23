@@ -1,6 +1,8 @@
 #pragma once
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <string_view>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -141,7 +143,12 @@ public:
 
 private:
     Json Snapshot() {
-        const auto start = std::chrono::steady_clock::now();
+        const auto start = GpuMemoryProfiling() ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
+#ifdef ENABLE_VULKAN
+        if (SyncGpuMemoryStatus())
+            Vulkan::SampleGpuMemory(true);
+#endif
         const auto audio = AudioCore::WorkerSink::Drain();
         Json snapshot{{"debug_api", true}, {"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
                 {"last_error", last_error},         {"input_owner", owner},
@@ -152,7 +159,7 @@ private:
                 {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"},
                 {"transport", writer.Stats()}, {"gpu_memory", GpuMemory()},
                 {"features", Features()}};
-        if (auto& gpu = snapshot["gpu_memory"]; gpu.is_object()) {
+        if (auto& gpu = snapshot["gpu_memory"]; GpuMemoryProfiling() && gpu.is_object()) {
             gpu["snapshot_ns"] = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count();
         }
@@ -173,12 +180,20 @@ private:
     }
     /// VMA heap budgets and this process's device-memory blocks (lotus#46); null without a
     /// Vulkan renderer.
+    static bool GpuMemoryProfiling() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("CTR_WORKER_GPU_MEMORY_PROFILE");
+            return value && std::string_view{value} == "1";
+        }();
+        return enabled;
+    }
+
     static Json GpuMemory([[maybe_unused]] bool failure_report = false) {
 #ifdef ENABLE_VULKAN
-        const auto start = std::chrono::steady_clock::now();
+        const auto start = GpuMemoryProfiling() ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
         const auto stats = Vulkan::QueryGpuMemory(failure_report);
-        const auto query_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start).count();
+        const auto queried = GpuMemoryProfiling() ? std::chrono::steady_clock::now() : start;
         if (!stats.available && !failure_report)
             return nullptr;
         const bool fresh = !stats.invalidated && stats.sample_age_ms &&
@@ -192,23 +207,28 @@ private:
                              {"block_bytes", heap.block_bytes},
                              {"block_bytes_high_water", heap.block_bytes_high_water},
                              {"allocation_bytes", heap.allocation_bytes}});
-        return {{"budget_source", !stats.available ? Json(nullptr)
+        Json result{{"budget_source", !stats.available ? Json(nullptr)
                                   : stats.budget_extension ? Json("VK_EXT_memory_budget")
                                                            : Json("vma_estimate")},
                 {"sample_state", fresh ? "fresh" : stats.sample_age_ms ? "stale" : "unknown"},
                 {"sample_sequence", stats.sample_sequence},
                 {"sample_age_ms", stats.sample_age_ms ? Json(*stats.sample_age_ms) : Json(nullptr)},
                 {"sample_ttl_ms", Vulkan::GPU_MEMORY_SAMPLE_TTL.count()},
-                {"timings_ns", {{"cache_read", query_ns},
-                                {"accounting_wait", stats.accounting_wait_ns},
-                                {"sample", stats.sample_ns},
-                                {"vma", stats.vma_ns},
-                                {"vulkan", stats.vulkan_ns},
-                                {"adapter", stats.adapter_ns}}},
                 {"allocation_failures", stats.allocation_failures},
                 {"adapter_dedicated_usage_bytes", stats.adapter_dedicated_usage_bytes
                      ? Json(*stats.adapter_dedicated_usage_bytes) : Json(nullptr)},
                 {"heaps", std::move(heaps)}};
+        if (GpuMemoryProfiling()) {
+            result["timings_ns"] = {
+                {"cache_read", std::chrono::duration_cast<std::chrono::nanoseconds>(queried - start).count()},
+                {"accounting_wait", stats.accounting_wait_ns},
+                {"sample", stats.sample_ns},
+                {"vma", stats.vma_ns},
+                {"vulkan", stats.vulkan_ns},
+                {"adapter", stats.adapter_ns},
+            };
+        }
+        return result;
 #else
         return nullptr;
 #endif
@@ -247,7 +267,18 @@ private:
     // Only Vulkan sessions need a sampler. It also runs while guest execution is paused.
     std::jthread gpu_sampler;
 
+    // Diagnostic rollback and A/B comparison with the old synchronous status path.
+    static bool SyncGpuMemoryStatus() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("CTR_WORKER_GPU_MEMORY_SYNC");
+            return value && std::string_view{value} == "1";
+        }();
+        return enabled;
+    }
+
     void StartGpuSampler() {
+        if (SyncGpuMemoryStatus())
+            return;
         Vulkan::SampleGpuMemory();
         if (!gpu_sampler.joinable() && Vulkan::QueryGpuMemory().available) {
             gpu_sampler = std::jthread{[](std::stop_token stop) {
@@ -345,7 +376,7 @@ private:
             if (method == "gpu_memory_refresh") {
 #ifdef ENABLE_VULKAN
                 Vulkan::SampleGpuMemory();
-                Reply(request, "ok", GpuMemory());
+                Reply(request, "ok", {{"gpu_memory", GpuMemory()}});
 #else
                 Reply(request, "unsupported");
 #endif

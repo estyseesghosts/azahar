@@ -128,10 +128,13 @@ public:
             query = nullptr;
         }
         usage.reset();
+        sampled_at = {};
     }
 
-    std::optional<u64> Read() {
-        if (query) {
+    std::optional<u64> Read(bool throttle) {
+        const auto now = Clock::now();
+        if (query && (!throttle || now - sampled_at >= GPU_MEMORY_SAMPLE_INTERVAL)) {
+            sampled_at = now;
             PDH_FMT_COUNTERVALUE value{};
             if (PdhCollectQueryData(query) == ERROR_SUCCESS &&
                 PdhGetFormattedCounterValue(counter, PDH_FMT_LARGE, nullptr, &value) ==
@@ -150,6 +153,7 @@ private:
     PDH_HQUERY query{};
     PDH_HCOUNTER counter{};
     std::optional<u64> usage;
+    Clock::time_point sampled_at{};
 };
 #endif
 
@@ -400,7 +404,7 @@ void InvalidateGpuMemory() {
     memory_invalidated.store(true, std::memory_order_release);
 }
 
-void SampleGpuMemory() {
+void SampleGpuMemory(bool sync_status) {
     auto& accounts = Accounts();
     const auto start = Clock::now();
     std::scoped_lock lock{accounts.mutex};
@@ -414,7 +418,7 @@ void SampleGpuMemory() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(sampled_at - start).count();
 #ifdef _WIN32
     const auto adapter_start = Clock::now();
-    stats.adapter_dedicated_usage_bytes = accounts.dedicated_usage.Read();
+    stats.adapter_dedicated_usage_bytes = accounts.dedicated_usage.Read(sync_status);
     stats.adapter_ns = ElapsedNs(adapter_start);
 #endif
     const VkPhysicalDeviceMemoryProperties* properties{};
@@ -463,9 +467,12 @@ GpuMemoryStats QueryGpuMemory(bool failure_report) {
     {
         std::unique_lock lock{accounts.sample_mutex, std::defer_lock};
         // A fatal error can arrive on a renderer thread. Never wait for the sampler here.
-        if (!failure_report || lock.try_lock()) {
-            if (!failure_report)
-                lock.lock();
+        if (failure_report) {
+            lock.try_lock();
+        } else {
+            lock.lock();
+        }
+        if (lock.owns_lock()) {
             stats = accounts.sample;
             if (stats.sample_sequence) {
                 const auto age = Clock::now() - accounts.sampled_at;

@@ -78,7 +78,7 @@ inline constexpr auto GPU_MEMORY_SAMPLE_INTERVAL = std::chrono::milliseconds{500
 inline constexpr auto GPU_MEMORY_SAMPLE_TTL = std::chrono::milliseconds{1000};
 
 /// Sample on the worker's telemetry thread or at a load/diagnostic boundary.
-void SampleGpuMemory();
+void SampleGpuMemory(bool sync_status = false);
 /// Invalidate admission data before reporting a terminal Vulkan failure.
 void InvalidateGpuMemory();
 /// Copy the published sample and live counters without calling a driver.
