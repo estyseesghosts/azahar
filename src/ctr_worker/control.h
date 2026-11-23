@@ -1,4 +1,5 @@
 #pragma once
+#include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <mutex>
@@ -140,8 +141,9 @@ public:
 
 private:
     Json Snapshot() {
+        const auto start = std::chrono::steady_clock::now();
         const auto audio = AudioCore::WorkerSink::Drain();
-        return {{"debug_api", true}, {"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
+        Json snapshot{{"debug_api", true}, {"backend_name", CTR_BACKEND_NAME}, {"source", CTR_SOURCE_SHA}, {"frames", window.frames},
                 {"last_error", last_error},         {"input_owner", owner},
                 {"buttons", input.buttons},         {"touch_down", input.touch},
                 {"audio_samples", audio.samples},   {"audio_dropped", audio.dropped},
@@ -150,6 +152,11 @@ private:
                 {"preview", PreviewRing::Supported() ? "shared_memory_v1" : "capture"},
                 {"transport", writer.Stats()}, {"gpu_memory", GpuMemory()},
                 {"features", Features()}};
+        if (auto& gpu = snapshot["gpu_memory"]; gpu.is_object()) {
+            gpu["snapshot_ns"] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count();
+        }
+        return snapshot;
     }
     /// Optional control features this build implements (lotus#42). The host refuses a request
     /// that needs a feature missing here instead of sending it to a worker that would ignore
@@ -160,16 +167,22 @@ private:
             features.push_back("preview_nonblocking");
 #ifdef ENABLE_VULKAN
         features.push_back("gpu_memory");
+        features.push_back("gpu_memory_refresh");
 #endif
         return features;
     }
     /// VMA heap budgets and this process's device-memory blocks (lotus#46); null without a
     /// Vulkan renderer.
-    static Json GpuMemory() {
+    static Json GpuMemory([[maybe_unused]] bool failure_report = false) {
 #ifdef ENABLE_VULKAN
-        const auto stats = Vulkan::QueryGpuMemory();
-        if (!stats.available)
+        const auto start = std::chrono::steady_clock::now();
+        const auto stats = Vulkan::QueryGpuMemory(failure_report);
+        const auto query_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (!stats.available && !failure_report)
             return nullptr;
+        const bool fresh = !stats.invalidated && stats.sample_age_ms &&
+                           *stats.sample_age_ms < Vulkan::GPU_MEMORY_SAMPLE_TTL.count();
         Json heaps = Json::array();
         for (const auto& heap : stats.heaps)
             heaps.push_back({{"device_local", heap.device_local},
@@ -179,8 +192,19 @@ private:
                              {"block_bytes", heap.block_bytes},
                              {"block_bytes_high_water", heap.block_bytes_high_water},
                              {"allocation_bytes", heap.allocation_bytes}});
-        return {{"budget_source", stats.budget_extension ? "VK_EXT_memory_budget"
-                                                         : "vma_estimate"},
+        return {{"budget_source", !stats.available ? Json(nullptr)
+                                  : stats.budget_extension ? Json("VK_EXT_memory_budget")
+                                                           : Json("vma_estimate")},
+                {"sample_state", fresh ? "fresh" : stats.sample_age_ms ? "stale" : "unknown"},
+                {"sample_sequence", stats.sample_sequence},
+                {"sample_age_ms", stats.sample_age_ms ? Json(*stats.sample_age_ms) : Json(nullptr)},
+                {"sample_ttl_ms", Vulkan::GPU_MEMORY_SAMPLE_TTL.count()},
+                {"timings_ns", {{"cache_read", query_ns},
+                                {"accounting_wait", stats.accounting_wait_ns},
+                                {"sample", stats.sample_ns},
+                                {"vma", stats.vma_ns},
+                                {"vulkan", stats.vulkan_ns},
+                                {"adapter", stats.adapter_ns}}},
                 {"allocation_failures", stats.allocation_failures},
                 {"adapter_dedicated_usage_bytes", stats.adapter_dedicated_usage_bytes
                      ? Json(*stats.adapter_dedicated_usage_bytes) : Json(nullptr)},
@@ -193,12 +217,13 @@ private:
     /// One stderr line the host classifies (lotus failure.rs), plus the frame and budgets.
     /// The frame counter is the emulation thread's; it is left out on renderer threads.
     void ReportGpuFailure(const Vulkan::GpuFailure& error) {
+        Vulkan::InvalidateGpuMemory();
         Vulkan::AcknowledgeFault();
         Json report{{"cause", error.cause},
                     {"vk_result", error.vk_result},
                     {"vk_result_name", error.vk_result_name},
                     {"object", error.object},
-                    {"gpu_memory", GpuMemory()}};
+                    {"gpu_memory", GpuMemory(true)}};
         if (std::this_thread::get_id() == main_thread)
             report["frame"] = window.frames;
         std::cerr << "worker_gpu_error: " << report.dump() << std::endl;
@@ -219,6 +244,25 @@ private:
         std::fflush(nullptr);
         std::_Exit(GPU_FAILURE_EXIT);
     }
+    // Only Vulkan sessions need a sampler. It also runs while guest execution is paused.
+    std::jthread gpu_sampler;
+
+    void StartGpuSampler() {
+        Vulkan::SampleGpuMemory();
+        if (!gpu_sampler.joinable() && Vulkan::QueryGpuMemory().available) {
+            gpu_sampler = std::jthread{[](std::stop_token stop) {
+                std::mutex mutex;
+                std::condition_variable_any wake;
+                std::unique_lock lock{mutex};
+                while (!stop.stop_requested()) {
+                    wake.wait_for(lock, stop, Vulkan::GPU_MEMORY_SAMPLE_INTERVAL, [] { return false; });
+                    if (!stop.stop_requested())
+                        Vulkan::SampleGpuMemory();
+                }
+            }};
+        }
+    }
+
     static inline Control* active = nullptr;
     static inline std::thread::id main_thread;
 #endif
@@ -298,6 +342,15 @@ private:
                 Reply(request, "ok", Snapshot());
                 return;
             }
+            if (method == "gpu_memory_refresh") {
+#ifdef ENABLE_VULKAN
+                Vulkan::SampleGpuMemory();
+                Reply(request, "ok", GpuMemory());
+#else
+                Reply(request, "unsupported");
+#endif
+                return;
+            }
             if (method == "debug") {
                 if (params.value("operation", "") == "input_state") {
                     if (!system.IsPoweredOn()) throw std::invalid_argument("input requires loaded content");
@@ -359,6 +412,9 @@ private:
                     Reply(request, "not_ready", {{"load_result", static_cast<u32>(result)}});
                     return;
                 }
+#ifdef ENABLE_VULKAN
+                StartGpuSampler();
+#endif
                 content = path;
                 state = "paused";
                 ++epoch;

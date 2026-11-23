@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <exception>
 #include <optional>
 #include <string>
@@ -59,12 +60,28 @@ struct GpuMemoryStats {
     /// True when budgets come from VK_EXT_memory_budget (they then include other processes);
     /// otherwise VMA estimates the budget as 80 % of the heap and usage from this process.
     bool budget_extension = false;
+    bool invalidated = false;
+    u64 sample_sequence = 0;
+    std::optional<u64> sample_age_ms;
+    u64 accounting_wait_ns = 0;
+    u64 sample_ns = 0;
+    u64 vma_ns = 0;
+    u64 vulkan_ns = 0;
+    u64 adapter_ns = 0;
     u64 allocation_failures = 0;
     /// WDDM dedicated usage across processes on a supported Windows adapter.
     std::optional<u64> adapter_dedicated_usage_bytes;
     std::vector<GpuMemoryHeap> heaps;
 };
 
-GpuMemoryStats QueryGpuMemory();
+inline constexpr auto GPU_MEMORY_SAMPLE_INTERVAL = std::chrono::milliseconds{500};
+inline constexpr auto GPU_MEMORY_SAMPLE_TTL = std::chrono::milliseconds{1000};
+
+/// Sample on the worker's telemetry thread or at a load/diagnostic boundary.
+void SampleGpuMemory();
+/// Invalidate admission data before reporting a terminal Vulkan failure.
+void InvalidateGpuMemory();
+/// Copy the published sample and live counters without calling a driver.
+GpuMemoryStats QueryGpuMemory(bool failure_report = false);
 
 } // namespace Vulkan
