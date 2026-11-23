@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <array>
+#include <atomic>
 #include <csignal>
 #include <cstring>
 #include <boost/serialization/array.hpp>
@@ -565,6 +566,68 @@ void MemorySystem::UnregisterPageTable(std::shared_ptr<PageTable> page_table) {
     }
 }
 
+namespace {
+// Luma3DS-style physical alias (bit 31 set), added with the 3GX plugin loader (Citra #6172).
+// Only FCRAM and the LCD/GPU registers in the I/O area are emulated. Anything else, including
+// accesses that cross a region end and non-word register accesses, is rejected and takes the
+// page-table path, where an unmapped page reports the usual unmapped access (lotus#155).
+enum class LumaAliasKind { Fcram, Register, Rejected };
+struct LumaAliasTarget {
+    LumaAliasKind kind;
+    u32 address; // FCRAM offset or GPU register virtual address
+    const char* reason;
+};
+
+LumaAliasTarget ClassifyLumaAlias(PAddr paddr, std::size_t size) {
+    const u64 end = u64{paddr} + size;
+    if (paddr >= Memory::FCRAM_PADDR && paddr < Memory::FCRAM_N3DS_PADDR_END) {
+        // Model-dependent FCRAM size, as MemorySystem::Impl::serialize saves it.
+        const u64 fcram_end = Settings::values.is_new_3ds.GetValue()
+                                  ? Memory::FCRAM_N3DS_PADDR_END
+                                  : Memory::FCRAM_PADDR_END;
+        if (end > fcram_end) {
+            return {LumaAliasKind::Rejected, 0,
+                    paddr >= fcram_end ? "beyond this model's FCRAM" : "crosses the end of FCRAM"};
+        }
+        return {LumaAliasKind::Fcram, paddr - Memory::FCRAM_PADDR, nullptr};
+    }
+    if (paddr >= Memory::IO_AREA_PADDR && paddr < Memory::IO_AREA_PADDR_END) {
+        if (end > Memory::IO_AREA_PADDR_END) {
+            return {LumaAliasKind::Rejected, 0, "crosses the end of the I/O area"};
+        }
+        if (size != sizeof(u32)) {
+            return {LumaAliasKind::Rejected, 0, "I/O register access is not 32-bit"};
+        }
+        if (paddr % sizeof(u32) != 0) {
+            return {LumaAliasKind::Rejected, 0, "misaligned I/O register access"};
+        }
+        const VAddr io = paddr - Memory::IO_AREA_PADDR + Memory::IO_AREA_VADDR;
+        if (!VideoCore::GPU::IsRegister(io)) {
+            return {LumaAliasKind::Rejected, 0, "I/O address outside the emulated LCD/GPU registers"};
+        }
+        return {LumaAliasKind::Register, io, nullptr};
+    }
+    return {LumaAliasKind::Rejected, 0, "not FCRAM or the I/O area"};
+}
+
+// Logs the first 64 rejections, then each power-of-two count, so a guest loop cannot flood the
+// log while the count stays visible.
+void LogLumaAliasRejection(VAddr vaddr, PAddr paddr, std::size_t size, bool read, u64 value,
+                           const char* reason, u32 pc) {
+    static std::atomic<u64> rejections{0};
+    const u64 count = ++rejections;
+    if (count > 64 && (count & (count - 1))) {
+        return;
+    }
+    LOG_ERROR(HW_Memory,
+              "Luma alias {}{}{} @ 0x{:08X} (PA 0x{:08X}) at PC 0x{:08X} rejected: {} "
+              "(rejection {})",
+              read ? "Read" : "Write", size * 8,
+              read ? std::string{} : fmt::format(" 0x{:X}", value), vaddr, paddr, pc, reason,
+              count);
+}
+} // namespace
+
 template <typename T>
 void MemorySystem::UnmappedAccess(const VAddr vaddr, const T value, bool read) {
     const std::string mode = (read ? "Read" : "Write");
@@ -603,19 +666,16 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
 
     if (vaddr & LUMA_ALIAS_BIT) [[unlikely]] {
         const PAddr paddr = vaddr & ~LUMA_ALIAS_BIT;
-
-        // FCRAM (0x2xxxxxxx)
-        if ((paddr & 0xF0000000) == Memory::FCRAM_PADDR) {
+        const auto target = ClassifyLumaAlias(paddr, read_size);
+        if (target.kind == LumaAliasKind::Fcram) {
             ReadType value;
-            std::memcpy(&value, GetFCRAMPointer(paddr - Memory::FCRAM_PADDR), read_size);
+            std::memcpy(&value, GetFCRAMPointer(target.address), read_size);
             return value;
         }
-
-        // MMIO (0x1xxxxxxx, >= IO_AREA_PADDR) - Strictly 32-bit
-        if ((paddr & 0xF0000000) == 0x10000000 && paddr >= Memory::IO_AREA_PADDR) [[unlikely]] {
-            return static_cast<ReadType>(impl->system.GPU().ReadReg(
-                static_cast<VAddr>(paddr) - Memory::IO_AREA_PADDR + 0x1EC00000));
+        if (target.kind == LumaAliasKind::Register) {
+            return static_cast<ReadType>(impl->system.GPU().ReadReg(target.address));
         }
+        LogLumaAliasRejection(vaddr, paddr, read_size, true, 0, target.reason, impl->GetPC());
         // Fallthrough: Standard page table lookup
     }
 
@@ -697,21 +757,17 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
 
     if (vaddr & LUMA_ALIAS_BIT) [[unlikely]] {
         const PAddr paddr = vaddr & ~LUMA_ALIAS_BIT;
-
-        // FCRAM (0x2xxxxxxx)
-        if ((paddr & 0xF0000000) == Memory::FCRAM_PADDR) {
-            std::memcpy(GetFCRAMPointer(paddr - Memory::FCRAM_PADDR), &data, sizeof(T));
+        const auto target = ClassifyLumaAlias(paddr, sizeof(T));
+        if (target.kind == LumaAliasKind::Fcram) {
+            std::memcpy(GetFCRAMPointer(target.address), &data, sizeof(T));
             return;
         }
-
-        // MMIO (0x1xxxxxxx, >= IO_AREA_PADDR) - Strictly 32-bit
-        if ((paddr & 0xF0000000) == 0x10000000 && paddr >= Memory::IO_AREA_PADDR) [[unlikely]] {
-            ASSERT(sizeof(data) == sizeof(u32));
-            impl->system.GPU().WriteReg(static_cast<VAddr>(paddr) - Memory::IO_AREA_PADDR +
-                                            0x1EC00000,
-                                        static_cast<u32>(data));
+        if (target.kind == LumaAliasKind::Register) {
+            impl->system.GPU().WriteReg(target.address, static_cast<u32>(data));
             return;
         }
+        LogLumaAliasRejection(vaddr, paddr, sizeof(T), false, static_cast<u64>(data),
+                              target.reason, impl->GetPC());
         // Fallthrough: Standard page table lookup
     }
 

@@ -78,6 +78,10 @@ public:
     /// Writes the provided value to the GPU virtual address.
     void WriteReg(VAddr addr, u32 data);
 
+    /// True when ReadReg and WriteReg handle a 32-bit access at `addr`: word aligned, in the
+    /// LCD or GPU register pages and below that block's register count.
+    static bool IsRegister(VAddr addr);
+
     /// Returns a mutable reference to the renderer.
     [[nodiscard]] VideoCore::RendererBase& Renderer();
 
